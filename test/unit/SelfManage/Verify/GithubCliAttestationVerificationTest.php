@@ -4,8 +4,10 @@ declare(strict_types=1);
 
 namespace Php\PieUnitTest\SelfManage\Verify;
 
+use Composer\IO\BufferIO;
 use Composer\Util\Platform;
 use Php\Pie\File\BinaryFile;
+use Php\Pie\SelfManage\Update\FetchPieRelease;
 use Php\Pie\SelfManage\Update\ReleaseMetadata;
 use Php\Pie\SelfManage\Verify\FailedToVerifyRelease;
 use Php\Pie\SelfManage\Verify\GithubCliAttestationVerification;
@@ -13,7 +15,6 @@ use Php\Pie\SelfManage\Verify\GithubCliNotAvailable;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\MockObject\MockObject;
 use PHPUnit\Framework\TestCase;
-use Symfony\Component\Console\Output\BufferedOutput;
 use Symfony\Component\Process\ExecutableFinder;
 
 #[CoversClass(GithubCliAttestationVerification::class)]
@@ -25,17 +26,19 @@ final class GithubCliAttestationVerificationTest extends TestCase
     private const FAKE_GH_CLI_UNHAPPY_BAT = __DIR__ . '/../../../assets/fake-gh-cli/unhappy.bat';
 
     private ExecutableFinder&MockObject $executableFinder;
-    private BufferedOutput $output;
+    private BufferIO $io;
     private GithubCliAttestationVerification $verifier;
+    private FetchPieRelease&MockObject $fetchPieRelease;
 
     public function setUp(): void
     {
         parent::setUp();
 
         $this->executableFinder = $this->createMock(ExecutableFinder::class);
-        $this->output           = new BufferedOutput();
+        $this->io               = new BufferIO();
+        $this->fetchPieRelease  = $this->createMock(FetchPieRelease::class);
 
-        $this->verifier = new GithubCliAttestationVerification($this->executableFinder);
+        $this->verifier = new GithubCliAttestationVerification($this->executableFinder, $this->fetchPieRelease);
     }
 
     public function testPassingVerification(): void
@@ -44,9 +47,24 @@ final class GithubCliAttestationVerificationTest extends TestCase
             ->method('find')
             ->willReturn(Platform::isWindows() ? self::FAKE_GH_CLI_HAPPY_BAT : self::FAKE_GH_CLI_HAPPY_SH);
 
-        $this->verifier->verify(new ReleaseMetadata('1.2.3', 'https://path/to/download'), new BinaryFile('/path/to/phar', 'some-checksum'), $this->output);
+        $this->verifier->verify(new ReleaseMetadata('1.2.3', 'https://path/to/download'), new BinaryFile('/path/to/phar', 'some-checksum'), $this->io);
 
-        self::assertStringContainsString('Verified the new PIE version', $this->output->fetch());
+        self::assertStringContainsString('Verified the new PIE version', $this->io->getOutput());
+    }
+
+    public function testPassingVerificationForNightly(): void
+    {
+        $this->executableFinder
+            ->method('find')
+            ->willReturn(Platform::isWindows() ? self::FAKE_GH_CLI_HAPPY_BAT : self::FAKE_GH_CLI_HAPPY_SH);
+
+        $this->fetchPieRelease->expects(self::once())
+            ->method('trunkBranch')
+            ->willReturn('1.5.x');
+
+        $this->verifier->verify(new ReleaseMetadata('nightly', 'https://path/to/download'), new BinaryFile('/path/to/phar', 'some-checksum'), $this->io);
+
+        self::assertStringContainsString('Verified the new PIE version', $this->io->getOutput());
     }
 
     public function testCannotFindGhCli(): void
@@ -56,7 +74,7 @@ final class GithubCliAttestationVerificationTest extends TestCase
             ->willReturn(null);
 
         $this->expectException(GithubCliNotAvailable::class);
-        $this->verifier->verify(new ReleaseMetadata('1.2.3', 'https://path/to/download'), new BinaryFile('/path/to/phar', 'some-checksum'), $this->output);
+        $this->verifier->verify(new ReleaseMetadata('1.2.3', 'https://path/to/download'), new BinaryFile('/path/to/phar', 'some-checksum'), $this->io);
     }
 
     public function testFailingVerification(): void
@@ -66,6 +84,6 @@ final class GithubCliAttestationVerificationTest extends TestCase
             ->willReturn(Platform::isWindows() ? self::FAKE_GH_CLI_UNHAPPY_BAT : self::FAKE_GH_CLI_UNHAPPY_SH);
 
         $this->expectException(FailedToVerifyRelease::class);
-        $this->verifier->verify(new ReleaseMetadata('1.2.3', 'https://path/to/download'), new BinaryFile('/path/to/phar', 'some-checksum'), $this->output);
+        $this->verifier->verify(new ReleaseMetadata('1.2.3', 'https://path/to/download'), new BinaryFile('/path/to/phar', 'some-checksum'), $this->io);
     }
 }

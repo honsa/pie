@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Php\PieUnitTest\Installing\Ini;
 
+use Composer\IO\BufferIO;
 use Composer\Package\CompletePackageInterface;
 use Php\Pie\DependencyResolver\Package;
 use Php\Pie\Downloading\DownloadedPackage;
@@ -21,12 +22,12 @@ use Php\Pie\Platform\ThreadSafetyMode;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\MockObject\MockObject;
 use PHPUnit\Framework\TestCase;
-use Symfony\Component\Console\Output\BufferedOutput;
+use Symfony\Component\Console\Output\OutputInterface;
 
 #[CoversClass(PreCheckExtensionAlreadyLoaded::class)]
 final class PreCheckExtensionAlreadyLoadedTest extends TestCase
 {
-    private BufferedOutput $output;
+    private BufferIO $io;
     private PhpBinaryPath&MockObject $mockPhpBinary;
     private TargetPlatform $targetPlatform;
     private DownloadedPackage $downloadedPackage;
@@ -37,13 +38,9 @@ final class PreCheckExtensionAlreadyLoadedTest extends TestCase
     {
         parent::setUp();
 
-        $this->output = new BufferedOutput(BufferedOutput::VERBOSITY_VERBOSE);
+        $this->io = new BufferIO(verbosity: OutputInterface::VERBOSITY_VERBOSE);
 
         $this->mockPhpBinary = $this->createMock(PhpBinaryPath::class);
-        /**
-         * @psalm-suppress PossiblyNullFunctionCall
-         * @psalm-suppress UndefinedThisPropertyAssignment
-         */
         (fn () => $this->phpBinaryPath = '/path/to/php')
             ->bindTo($this->mockPhpBinary, PhpBinaryPath::class)();
 
@@ -54,6 +51,7 @@ final class PreCheckExtensionAlreadyLoadedTest extends TestCase
             Architecture::x86_64,
             ThreadSafetyMode::ThreadSafe,
             1,
+            null,
             null,
         );
 
@@ -86,13 +84,13 @@ final class PreCheckExtensionAlreadyLoadedTest extends TestCase
         $this->mockPhpBinary
             ->expects(self::once())
             ->method('assertExtensionIsLoadedInRuntime')
-            ->with($this->downloadedPackage->package->extensionName(), $this->output);
+            ->with($this->downloadedPackage->package->extensionName(), $this->io);
 
         self::assertTrue($this->preCheckExtensionAlreadyLoaded->setup(
             $this->targetPlatform,
             $this->downloadedPackage,
             $this->binaryFile,
-            $this->output,
+            $this->io,
         ));
     }
 
@@ -101,7 +99,7 @@ final class PreCheckExtensionAlreadyLoadedTest extends TestCase
         $this->mockPhpBinary
             ->expects(self::once())
             ->method('assertExtensionIsLoadedInRuntime')
-            ->with($this->downloadedPackage->package->extensionName(), $this->output)
+            ->with($this->downloadedPackage->package->extensionName(), $this->io)
             ->willThrowException(ExtensionIsNotLoaded::fromExpectedExtension(
                 $this->mockPhpBinary,
                 $this->downloadedPackage->package->extensionName(),
@@ -111,7 +109,7 @@ final class PreCheckExtensionAlreadyLoadedTest extends TestCase
             $this->targetPlatform,
             $this->downloadedPackage,
             $this->binaryFile,
-            $this->output,
+            $this->io,
         ));
     }
 }

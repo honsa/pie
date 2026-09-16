@@ -5,49 +5,89 @@ declare(strict_types=1);
 namespace Php\Pie\Command;
 
 use Composer\Composer;
+use Composer\IO\IOInterface;
+use Composer\Package\CompletePackageInterface;
 use Composer\Package\Version\VersionParser;
 use Composer\Repository\ComposerRepository;
 use Composer\Repository\PathRepository;
 use Composer\Repository\VcsRepository;
 use Composer\Util\Platform;
 use InvalidArgumentException;
+use OutOfRangeException;
+use Php\Pie\ComposerIntegration\PieComposerFactory;
+use Php\Pie\ComposerIntegration\PieComposerRequest;
+use Php\Pie\DependencyResolver\BundledPhpExtensionRefusal;
+use Php\Pie\DependencyResolver\DependencyResolver;
+use Php\Pie\DependencyResolver\InvalidPackageName;
 use Php\Pie\DependencyResolver\Package;
 use Php\Pie\DependencyResolver\RequestedPackageAndVersion;
+use Php\Pie\DependencyResolver\ResolvedPackageRequest;
+use Php\Pie\DependencyResolver\UnableToResolveRequirement;
+use Php\Pie\Downloading\DownloadUrlMethod;
+use Php\Pie\ExtensionName;
+use Php\Pie\Installing\InstallForPhpProject\FindMatchingPackages;
 use Php\Pie\Platform as PiePlatform;
 use Php\Pie\Platform\OperatingSystem;
 use Php\Pie\Platform\TargetPhp\PhpBinaryPath;
 use Php\Pie\Platform\TargetPhp\PhpizePath;
 use Php\Pie\Platform\TargetPlatform;
+use Php\Pie\Util\Realpath;
+use Psr\Container\ContainerInterface;
+use RuntimeException;
 use Symfony\Component\Console\Command\Command;
 use Symfony\Component\Console\Input\InputArgument;
 use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\Console\Input\InputOption;
-use Symfony\Component\Console\Output\OutputInterface;
+use Throwable;
+use ValueError;
 use Webmozart\Assert\Assert;
 
 use function array_key_exists;
+use function array_map;
+use function array_values;
+use function assert;
+use function count;
+use function explode;
+use function implode;
 use function is_array;
+use function is_dir;
 use function is_string;
 use function reset;
+use function Safe\chdir;
+use function Safe\getcwd;
 use function sprintf;
+use function str_starts_with;
 use function strtolower;
+use function substr;
 use function trim;
 
 use const PHP_VERSION;
 
-/** @internal This is not public API for PIE, so should not be depended upon unless you accept the risk of BC breaks */
+/**
+ * @internal This is not public API for PIE, so should not be depended upon unless you accept the risk of BC breaks
+ *
+ * @phpstan-import-type MatchingPackages from FindMatchingPackages
+ */
 final class CommandHelper
 {
-    public const ARG_REQUESTED_PACKAGE_AND_VERSION = 'requested-package-and-version';
-    public const OPTION_WITH_PHP_CONFIG            = 'with-php-config';
-    public const OPTION_WITH_PHP_PATH              = 'with-php-path';
-    public const OPTION_WITH_PHPIZE_PATH           = 'with-phpize-path';
-    public const OPTION_WORKING_DIRECTORY          = 'working-dir';
-    private const OPTION_MAKE_PARALLEL_JOBS        = 'make-parallel-jobs';
-    private const OPTION_SKIP_ENABLE_EXTENSION     = 'skip-enable-extension';
-    private const OPTION_FORCE                     = 'force';
+    public const ARG_REQUESTED_PACKAGE_AND_VERSION            = 'requested-package-and-version';
+    public const OPTION_WITH_PHP_CONFIG                       = 'with-php-config';
+    public const OPTION_WITH_PHP_PATH                         = 'with-php-path';
+    public const OPTION_WITH_PHPIZE_PATH                      = 'with-phpize-path';
+    public const OPTION_ALLOW_NON_INTERACTIVE_PROJECT_INSTALL = 'allow-non-interactive-project-install';
+    public const OPTION_NO_DEV                                = 'no-dev';
+    private const OPTION_PACKAGE_SELECTION                    = 'select';
+    private const OPTION_WORKING_DIRECTORY                    = 'working-dir';
+    private const OPTION_MAKE_PARALLEL_JOBS                   = 'make-parallel-jobs';
+    private const OPTION_SKIP_ENABLE_EXTENSION                = 'skip-enable-extension';
+    private const OPTION_FORCE                                = 'force';
+    private const OPTION_SUPPRESS_DOWNLOAD_URL_METHOD         = 'suppress-download-url-method';
+    private const OPTION_NO_CACHE                             = 'no-cache';
+    private const OPTION_AUTO_INSTALL_BUILD_TOOLS             = 'auto-install-build-tools';
+    private const OPTION_SUPPRESS_BUILD_TOOLS_CHECK           = 'no-build-tools-check';
+    private const OPTION_AUTO_INSTALL_SYSTEM_DEPENDENCIES     = 'auto-install-system-dependencies';
+    private const OPTION_SUPPRESS_SYSTEM_DEPENDENCIES_CHECK   = 'no-system-dependencies-check';
 
-    /** @psalm-suppress UnusedConstructor */
     private function __construct()
     {
     }
@@ -72,6 +112,22 @@ final class CommandHelper
             InputOption::VALUE_REQUIRED,
             'The path to the `phpize` binary to use as the target PHP platform, e.g. --' . self::OPTION_WITH_PHPIZE_PATH . '=/usr/bin/phpize7.4',
         );
+        $command->addOption(
+            self::OPTION_NO_CACHE,
+            null,
+            InputOption::VALUE_NONE,
+            'Prevent the use of the Composer cache.',
+        );
+    }
+
+    public static function configureBuildToolsCheckOptions(Command $command): void
+    {
+        $command->addOption(
+            self::OPTION_AUTO_INSTALL_BUILD_TOOLS,
+            null,
+            InputOption::VALUE_NONE,
+            'If build tools are missing, automatically install them, instead of prompting.',
+        );
     }
 
     public static function configureDownloadBuildInstallOptions(Command $command, bool $withRequestedPackageAndVersion = true): void
@@ -79,8 +135,8 @@ final class CommandHelper
         if ($withRequestedPackageAndVersion) {
             $command->addArgument(
                 self::ARG_REQUESTED_PACKAGE_AND_VERSION,
-                InputArgument::OPTIONAL,
-                'The PIE package name and version constraint to use, in the format {vendor/package}{?:{?version-constraint}{?@stability}}, for example `xdebug/xdebug:^3.4@alpha`, `xdebug/xdebug:@alpha`, `xdebug/xdebug:^3.4`, etc.',
+                InputArgument::OPTIONAL | InputArgument::IS_ARRAY,
+                'The PIE package names and versions constraint to use, in the format {vendor/package}{?:{?version-constraint}{?@stability}}, for example `xdebug/xdebug:^3.4@alpha`, `xdebug/xdebug:@alpha`, `xdebug/xdebug:^3.4`, etc.',
             );
         }
 
@@ -104,6 +160,14 @@ final class CommandHelper
         );
 
         $command->addOption(
+            self::OPTION_SUPPRESS_DOWNLOAD_URL_METHOD,
+            null,
+            InputOption::VALUE_REQUIRED | InputOption::VALUE_IS_ARRAY,
+            'Do not use the specified download URL methods if they are supported by the extension. May be specified multiple times. Valid values: '
+            . implode(', ', array_map(static fn (DownloadUrlMethod $downloadUrlMethod): string => $downloadUrlMethod->value, DownloadUrlMethod::cases())),
+        );
+
+        $command->addOption(
             self::OPTION_WORKING_DIRECTORY,
             'd',
             InputOption::VALUE_REQUIRED,
@@ -111,6 +175,48 @@ final class CommandHelper
         );
 
         self::configurePhpConfigOptions($command);
+
+        $command->addOption(
+            self::OPTION_ALLOW_NON_INTERACTIVE_PROJECT_INSTALL,
+            null,
+            InputOption::VALUE_NONE,
+            'Deprecated and ignored. Will emit a warning if used.',
+        );
+
+        $command->addOption(
+            self::OPTION_NO_DEV,
+            null,
+            InputOption::VALUE_NONE,
+            'When checking a project for required extensions, exclude any extensions declared in the root package\'s require-dev.',
+        );
+
+        $command->addOption(
+            self::OPTION_PACKAGE_SELECTION,
+            null,
+            InputOption::VALUE_REQUIRED | InputOption::VALUE_IS_ARRAY,
+            'Select a PIE package for a given extension name, e.g. `--select=foo=myvendor/foo` to resolve the `ext-foo` extension to `myvendor/foo` PIE package.',
+        );
+
+        self::configureBuildToolsCheckOptions($command);
+        $command->addOption(
+            self::OPTION_SUPPRESS_BUILD_TOOLS_CHECK,
+            null,
+            InputOption::VALUE_NONE,
+            'Do not perform the check to see if build tools are present on the system.',
+        );
+
+        $command->addOption(
+            self::OPTION_AUTO_INSTALL_SYSTEM_DEPENDENCIES,
+            null,
+            InputOption::VALUE_NONE,
+            'If system dependencies missing, automatically install them, instead of prompting.',
+        );
+        $command->addOption(
+            self::OPTION_SUPPRESS_SYSTEM_DEPENDENCIES_CHECK,
+            null,
+            InputOption::VALUE_NONE,
+            'Do not perform the check to see if system dependencies are present on the system.',
+        );
 
         /**
          * Allows additional options for the `./configure` command to be passed here.
@@ -124,7 +230,7 @@ final class CommandHelper
         $input->bind($command->getDefinition());
     }
 
-    public static function determineTargetPlatformFromInputs(InputInterface $input, OutputInterface $output): TargetPlatform
+    public static function determineTargetPlatformFromInputs(InputInterface $input, IOInterface $io): TargetPlatform
     {
         $phpBinaryPath = PhpBinaryPath::fromCurrentProcess();
 
@@ -143,15 +249,6 @@ final class CommandHelper
             throw new InvalidArgumentException('The --with-php-path=/path/to/php cannot be used on non-Windows, use --with-php-config=/path/to/php-config instead.');
         }
 
-        if (Platform::isWindows() && $input->hasOption(self::OPTION_WITH_PHPIZE_PATH)) {
-            /** @var mixed $withPhpizePath */
-            $withPhpizePath = $input->getOption(self::OPTION_WITH_PHPIZE_PATH);
-
-            if (is_string($withPhpizePath) && trim($withPhpizePath) !== '') {
-                throw new InvalidArgumentException('The --with-phpize-path=/path/to/phpize cannot be used on Windows.');
-            }
-        }
-
         if ($specifiedWithPhpConfig) {
             $phpBinaryPath = PhpBinaryPath::fromPhpConfigExecutable($withPhpConfig);
         }
@@ -168,10 +265,27 @@ final class CommandHelper
             }
         }
 
-        $targetPlatform = TargetPlatform::fromPhpBinaryPath($phpBinaryPath, $makeParallelJobs);
+        $phpizePath = null;
+        if ($input->hasOption(self::OPTION_WITH_PHPIZE_PATH)) {
+            $phpizePathOption = $input->getOption(self::OPTION_WITH_PHPIZE_PATH);
+            if (is_string($phpizePathOption) && trim($phpizePathOption) !== '') {
+                if (Platform::isWindows()) {
+                    throw new InvalidArgumentException('The --with-phpize-path=/path/to/phpize cannot be used on Windows.');
+                }
 
-        $output->writeln(sprintf('<info>You are running PHP %s</info>', PHP_VERSION));
-        $output->writeln(sprintf(
+                $phpizePath = new PhpizePath($phpizePathOption);
+            }
+        }
+
+        $targetPlatform = TargetPlatform::fromPhpBinaryPath($phpBinaryPath, $makeParallelJobs, $phpizePath);
+
+        if (PiePlatform::isRunningStaticPhp()) {
+            $io->write(sprintf('<info>You are running a PIE Static PHP %s build</info>', PHP_VERSION));
+        } else {
+            $io->write(sprintf('<info>You are running PHP %s</info>', PHP_VERSION));
+        }
+
+        $io->write(sprintf(
             '<info>Target PHP installation:</info> %s %s%s, on %s %s (from %s)',
             $phpBinaryPath->version(),
             $targetPlatform->threadSafety->asShort(),
@@ -180,12 +294,12 @@ final class CommandHelper
             $targetPlatform->architecture->name,
             $phpBinaryPath->phpBinaryPath,
         ));
-        $output->writeln(
+        $io->write(
             sprintf(
                 '<info>Using pie.json:</info> %s',
                 PiePlatform::getPieJsonFilename($targetPlatform),
             ),
-            OutputInterface::VERBOSITY_VERBOSE,
+            verbosity: IOInterface::VERBOSE,
         );
 
         return $targetPlatform;
@@ -201,95 +315,254 @@ final class CommandHelper
         return $input->hasOption(self::OPTION_FORCE) && $input->getOption(self::OPTION_FORCE);
     }
 
-    public static function determinePhpizePathFromInputs(InputInterface $input): PhpizePath|null
+    public static function assertExtensionPathIsConsistent(TargetPlatform $targetPlatform, InputInterface $input, IOInterface $io): void
     {
-        if ($input->hasOption(self::OPTION_WITH_PHPIZE_PATH)) {
-            $phpizePathOption = (string) $input->getOption(self::OPTION_WITH_PHPIZE_PATH);
-            if (trim($phpizePathOption) !== '') {
-                /** @psalm-suppress ArgumentTypeCoercion */
-                return new PhpizePath($phpizePathOption);
-            }
+        $phpConfigExtensionPath = $targetPlatform->phpBinaryPath->phpConfigExtensionPath();
+        $iniExtensionPath       = $targetPlatform->phpBinaryPath->extensionPath();
+
+        if ($phpConfigExtensionPath === null || Realpath::compare($phpConfigExtensionPath, $iniExtensionPath)) {
+            return;
         }
 
-        return null;
+        $message = sprintf(
+            <<<'ERROR'
+            The php.ini `extension_dir` directive (%s) does not match `php-config --extension-dir` (%s). This means
+            that installs will likely fail (as the extension will be installed in one place, but PHP is looking in
+            another place).
+
+
+            ERROR,
+            $iniExtensionPath,
+            $phpConfigExtensionPath,
+        );
+
+        if (! self::determineForceInstallingPackageVersion($input)) {
+            throw new RuntimeException($message . 'Re-run with --force to attempt the install anyway.');
+        }
+
+        $io->writeError('<comment>Warning: ' . $message . 'Proceeding anyway because --force was used.</comment>');
     }
 
-    public static function requestedNameAndVersionPair(InputInterface $input): RequestedPackageAndVersion
+    public static function noDev(InputInterface $input): bool
     {
-        $requestedPackageString = $input->getArgument(self::ARG_REQUESTED_PACKAGE_AND_VERSION);
+        return $input->hasOption(self::OPTION_NO_DEV) && $input->getOption(self::OPTION_NO_DEV);
+    }
 
-        if (! is_string($requestedPackageString) || $requestedPackageString === '') {
+    /** @return list<DownloadUrlMethod> */
+    public static function determineSuppressedDownloadUrlMethods(InputInterface $input): array
+    {
+        if (! $input->hasOption(self::OPTION_SUPPRESS_DOWNLOAD_URL_METHOD)) {
+            return [];
+        }
+
+        $suppressedDownloadUrlMethods = $input->getOption(self::OPTION_SUPPRESS_DOWNLOAD_URL_METHOD);
+        assert(is_array($suppressedDownloadUrlMethods));
+
+        return array_values(array_map(
+            static function (mixed $suppressedDownloadUrlMethod): DownloadUrlMethod {
+                assert(is_string($suppressedDownloadUrlMethod) && $suppressedDownloadUrlMethod !== '');
+
+                try {
+                    return DownloadUrlMethod::from($suppressedDownloadUrlMethod);
+                } catch (ValueError) {
+                    throw new InvalidArgumentException(sprintf(
+                        'Invalid value "%s" for --%s; valid values are: %s',
+                        $suppressedDownloadUrlMethod,
+                        self::OPTION_SUPPRESS_DOWNLOAD_URL_METHOD,
+                        implode(', ', array_map(static fn (DownloadUrlMethod $downloadUrlMethod): string => $downloadUrlMethod->value, DownloadUrlMethod::cases())),
+                    ));
+                }
+            },
+            $suppressedDownloadUrlMethods,
+        ));
+    }
+
+    public static function autoInstallBuildTools(InputInterface $input): bool
+    {
+        return $input->hasOption(self::OPTION_AUTO_INSTALL_BUILD_TOOLS)
+            && $input->getOption(self::OPTION_AUTO_INSTALL_BUILD_TOOLS);
+    }
+
+    public static function shouldCheckForBuildTools(InputInterface $input): bool
+    {
+        if (Platform::isWindows()) {
+            return false;
+        }
+
+        return ! $input->hasOption(self::OPTION_SUPPRESS_BUILD_TOOLS_CHECK)
+            || ! $input->getOption(self::OPTION_SUPPRESS_BUILD_TOOLS_CHECK);
+    }
+
+    public static function autoInstallSystemDependencies(InputInterface $input): bool
+    {
+        return $input->hasOption(self::OPTION_AUTO_INSTALL_SYSTEM_DEPENDENCIES)
+            && $input->getOption(self::OPTION_AUTO_INSTALL_SYSTEM_DEPENDENCIES);
+    }
+
+    public static function shouldCheckSystemDependencies(InputInterface $input): bool
+    {
+        if (Platform::isWindows()) {
+            return false;
+        }
+
+        return ! $input->hasOption(self::OPTION_SUPPRESS_SYSTEM_DEPENDENCIES_CHECK)
+            || ! $input->getOption(self::OPTION_SUPPRESS_SYSTEM_DEPENDENCIES_CHECK);
+    }
+
+    /** @return non-empty-list<RequestedPackageAndVersion> */
+    public static function requestedNameAndVersionPairs(InputInterface $input): array
+    {
+        $requestedPackageStrings = $input->getArgument(self::ARG_REQUESTED_PACKAGE_AND_VERSION);
+
+        if (is_string($requestedPackageStrings)) {
+            $requestedPackageStrings = [$requestedPackageStrings];
+        }
+
+        if (! is_array($requestedPackageStrings) || ! count($requestedPackageStrings)) {
             throw new InvalidArgumentException('No package was requested for installation');
         }
 
-        $nameAndVersionPairs         = (new VersionParser())
-            ->parseNameVersionPairs([$requestedPackageString]);
-        $requestedNameAndVersionPair = reset($nameAndVersionPairs);
+        Assert::allStringNotEmpty($requestedPackageStrings);
 
-        if (! is_array($requestedNameAndVersionPair)) {
-            throw new InvalidArgumentException('Failed to parse the name/version pair');
-        }
+        return array_values(array_map(
+            static function (string $requestedPackageString): RequestedPackageAndVersion {
+                $nameAndVersionPairs         = (new VersionParser())
+                    ->parseNameVersionPairs([$requestedPackageString]);
+                $requestedNameAndVersionPair = reset($nameAndVersionPairs);
 
-        if (! array_key_exists('version', $requestedNameAndVersionPair)) {
-            $requestedNameAndVersionPair['version'] = null;
-        }
+                if (! is_array($requestedNameAndVersionPair)) {
+                    throw new InvalidArgumentException('Failed to parse the name/version pair');
+                }
 
-        Assert::stringNotEmpty($requestedNameAndVersionPair['name']);
-        Assert::nullOrStringNotEmpty($requestedNameAndVersionPair['version']);
+                if (! array_key_exists('version', $requestedNameAndVersionPair)) {
+                    $requestedNameAndVersionPair['version'] = null;
+                }
 
-        return new RequestedPackageAndVersion(
-            $requestedNameAndVersionPair['name'],
-            $requestedNameAndVersionPair['version'],
+                Assert::stringNotEmpty($requestedNameAndVersionPair['name']);
+                Assert::nullOrStringNotEmpty($requestedNameAndVersionPair['version']);
+
+                return new RequestedPackageAndVersion(
+                    $requestedNameAndVersionPair['name'],
+                    $requestedNameAndVersionPair['version'],
+                );
+            },
+            $requestedPackageStrings,
+        ));
+    }
+
+    /**
+     * @param non-empty-list<RequestedPackageAndVersion> $requestedNamesAndVersions
+     *
+     * @return non-empty-list<ResolvedPackageRequest>
+     *
+     * @throws UnableToResolveRequirement
+     * @throws BundledPhpExtensionRefusal
+     */
+    public static function resolveRequestedPackages(
+        DependencyResolver $dependencyResolver,
+        IOInterface $io,
+        Composer $composer,
+        TargetPlatform $targetPlatform,
+        array $requestedNamesAndVersions,
+        bool $forceInstallPackageVersion,
+    ): array {
+        return array_map(
+            static function (RequestedPackageAndVersion $requestedNameAndVersion) use ($dependencyResolver, $io, $composer, $targetPlatform, $forceInstallPackageVersion): ResolvedPackageRequest {
+                $resolvedPackage = $dependencyResolver(
+                    $composer,
+                    $targetPlatform,
+                    $requestedNameAndVersion,
+                    $forceInstallPackageVersion,
+                );
+
+                $io->write(sprintf(
+                    '<info>Found package:</info> %s which provides <info>%s</info>',
+                    $resolvedPackage->piePackage->prettyNameAndVersion(),
+                    $resolvedPackage->piePackage->extensionName()->nameWithExtPrefix(),
+                ));
+
+                return $resolvedPackage;
+            },
+            $requestedNamesAndVersions,
         );
     }
 
-    public static function bindConfigureOptionsFromPackage(Command $command, Package $package, InputInterface $input): void
+    /**
+     * @param list<Package> $packages
+     *
+     * @throws ConfigureOptionCollision if two of the requested packages declare a configure option with the same name.
+     */
+    public static function bindConfigureOptionsFromPackage(Command $command, array $packages, InputInterface $input): void
     {
-        foreach ($package->configureOptions() as $configureOption) {
-            $command->addOption(
-                $configureOption->name,
-                null,
-                $configureOption->needsValue ? InputOption::VALUE_REQUIRED : InputOption::VALUE_NONE,
-                $configureOption->description,
-            );
+        /** @var array<string, Package> $optionOwners */
+        $optionOwners = [];
+
+        foreach ($packages as $package) {
+            foreach ($package->configureOptions() as $configureOption) {
+                if (array_key_exists($configureOption->name, $optionOwners)) {
+                    throw ConfigureOptionCollision::forOptionName(
+                        $configureOption->name,
+                        $optionOwners[$configureOption->name],
+                        $package,
+                    );
+                }
+
+                $optionOwners[$configureOption->name] = $package;
+
+                $command->addOption(
+                    $configureOption->name,
+                    null,
+                    $configureOption->needsValue ? InputOption::VALUE_REQUIRED : InputOption::VALUE_NONE,
+                    $configureOption->description,
+                );
+            }
         }
 
         self::validateInput($input, $command);
     }
 
-    /** @return list<non-empty-string> */
-    public static function processConfigureOptionsFromInput(Package $package, InputInterface $input): array
+    /**
+     * @param list<Package> $packages
+     *
+     * @return array<string, list<non-empty-string>> Keyed by package name
+     */
+    public static function processConfigureOptionsFromInput(array $packages, InputInterface $input): array
     {
         $configureOptionsValues = [];
-        foreach ($package->configureOptions() as $configureOption) {
-            if (! $input->hasOption($configureOption->name)) {
-                continue;
-            }
-
-            $value = $input->getOption($configureOption->name);
-
-            if ($configureOption->needsValue) {
-                if (is_string($value) && $value !== '') {
-                    $configureOptionsValues[] = '--' . $configureOption->name . '=' . $value;
+        foreach ($packages as $package) {
+            $optionsForPackage = [];
+            foreach ($package->configureOptions() as $configureOption) {
+                if (! $input->hasOption($configureOption->name)) {
+                    continue;
                 }
 
-                continue;
+                $value = $input->getOption($configureOption->name);
+
+                if ($configureOption->needsValue) {
+                    if (is_string($value) && $value !== '') {
+                        $optionsForPackage[] = '--' . $configureOption->name . '=' . $value;
+                    }
+
+                    continue;
+                }
+
+                Assert::boolean($value);
+                if ($value !== true) {
+                    continue;
+                }
+
+                $optionsForPackage[] = '--' . $configureOption->name;
             }
 
-            Assert::boolean($value);
-            if ($value !== true) {
-                continue;
-            }
-
-            $configureOptionsValues[] = '--' . $configureOption->name;
+            $configureOptionsValues[$package->name()] = $optionsForPackage;
         }
 
         return $configureOptionsValues;
     }
 
-    public static function listRepositories(Composer $composer, OutputInterface $output): void
+    public static function listRepositories(Composer $composer, IOInterface $io): void
     {
-        $output->writeln('The following repositories are in use for this Target PHP:');
+        $io->write('The following repositories are in use for this Target PHP:');
 
         foreach ($composer->getRepositoryManager()->getRepositories() as $repo) {
             if ($repo instanceof ComposerRepository) {
@@ -298,17 +571,16 @@ final class CommandHelper
                 $repoUrl = array_key_exists('url', $repoConfig) && is_string($repoConfig['url']) && $repoConfig['url'] !== '' ? $repoConfig['url'] : null;
 
                 if ($repoUrl === 'https://repo.packagist.org') {
-                    $output->writeln('  - Packagist');
+                    $io->write('  - Packagist');
                     continue;
                 }
 
-                $output->writeln(sprintf('  - Composer (%s)', $repoUrl ?? 'no url?'));
+                $io->write(sprintf('  - Composer (%s)', $repoUrl ?? 'no url?'));
                 continue;
             }
 
             if ($repo instanceof VcsRepository) {
-                /** @psalm-suppress InternalMethod */
-                $output->writeln(sprintf(
+                $io->write(sprintf(
                     '  - VCS Repository (%s)',
                     $repo->getDriver()?->getUrl() ?? 'no url?',
                 ));
@@ -320,10 +592,176 @@ final class CommandHelper
             }
 
             $repoConfig = $repo->getRepoConfig();
-            $output->writeln(sprintf(
+            $io->write(sprintf(
                 '  - Path Repository (%s)',
                 array_key_exists('url', $repoConfig) && is_string($repoConfig['url']) && $repoConfig['url'] !== '' ? $repoConfig['url'] : 'no path?',
             ));
         }
+    }
+
+    public static function handlePackageNotFound(
+        InvalidPackageName|UnableToResolveRequirement $exception,
+        FindMatchingPackages $findMatchingPackages,
+        IOInterface $io,
+        TargetPlatform $targetPlatform,
+        ContainerInterface $container,
+    ): int {
+        $pieComposer = PieComposerFactory::createPieComposer(
+            $container,
+            PieComposerRequest::noOperation(
+                $io,
+                $targetPlatform,
+            ),
+        );
+
+        $requestedPackageName = $exception->requestedPackageAndVersion->package;
+        if (str_starts_with($requestedPackageName, 'ext-')) {
+            $requestedPackageName = substr($requestedPackageName, 4);
+        }
+
+        assert($requestedPackageName !== '');
+
+        $io->writeError('');
+        $io->writeError(sprintf('<error>Could not install package: %s</error>', $requestedPackageName));
+        $io->writeError($exception->getMessage());
+
+        try {
+            $matches = self::augmentMatchesWithExtensionName(
+                $pieComposer,
+                $findMatchingPackages->bySearching($pieComposer, $requestedPackageName),
+                $io,
+            );
+
+            if (count($matches)) {
+                $io->write('');
+                if (count($matches) === 1) {
+                    $io->write('<info>Did you mean this?</info>');
+                } else {
+                    $io->write('<info>Did you mean one of these?</info>');
+                }
+
+                array_map(
+                    static function (array $match) use ($io): void {
+                        $io->write(sprintf(
+                            ' - %s%s: %s',
+                            $match['name'],
+                            array_key_exists('extension-name', $match) && is_string($match['extension-name'])
+                                ? ' (provides extension: ' . $match['extension-name'] . ')'
+                                : '',
+                            $match['description'] ?? 'no description available',
+                        ));
+                    },
+                    $matches,
+                );
+            }
+        } catch (OutOfRangeException) {
+            $io->writeError(
+                sprintf(
+                    'Tried searching for "%s", but nothing was found.',
+                    $requestedPackageName,
+                ),
+                verbosity: IOInterface::VERBOSE,
+            );
+        }
+
+        return 1;
+    }
+
+    /**
+     * Attempts to augment the given Composer package matches with the PIE extension name, where resolvable.
+     *
+     * @param MatchingPackages $matches
+     *
+     * @return MatchingPackages
+     */
+    public static function augmentMatchesWithExtensionName(Composer $pieComposer, array $matches, IOInterface $io): array
+    {
+        return array_map(
+            static function (array $match) use ($io, $pieComposer): array {
+                $composerMatchingPackage = $pieComposer->getRepositoryManager()->findPackage($match['name'], '*');
+
+                if ($composerMatchingPackage instanceof CompletePackageInterface) {
+                    try {
+                        $match['extension-name'] = Package
+                            ::fromComposerCompletePackage($composerMatchingPackage)
+                            ->extensionName()
+                            ->name();
+                    } catch (Throwable $t) {
+                        $io->writeError(
+                            sprintf(
+                                'Tried looking up extension name for %s, but failed: %s',
+                                $match['name'],
+                                $t->getMessage(),
+                            ),
+                            verbosity: IOInterface::VERY_VERBOSE,
+                        );
+                    }
+                }
+
+                return $match;
+            },
+            $matches,
+        );
+    }
+
+    public static function applyNoCacheOptionIfSet(InputInterface $input, IOInterface $io): void
+    {
+        if (! $input->hasOption(self::OPTION_NO_CACHE) || ! $input->getOption(self::OPTION_NO_CACHE)) {
+            return;
+        }
+
+        $io->writeError('Disabling cache usage', verbosity: IOInterface::DEBUG);
+        Platform::putEnv('COMPOSER_CACHE_DIR', Platform::isWindows() ? 'nul' : '/dev/null');
+    }
+
+    /**
+     * If the working directory option is set in the `$input`, change the working directory, and return a callable
+     * that will restore the working directory.
+     *
+     * @return callable(): void
+     */
+    public static function handleWorkingDirectory(InputInterface $input, IOInterface $io): callable
+    {
+        $workingDirOption = (string) $input->getOption(self::OPTION_WORKING_DIRECTORY);
+
+        // No working directory option used, or isn't a real path; this (and the returned callable) should be a no-op
+        if ($workingDirOption === '' || ! is_dir($workingDirOption)) {
+            return static function (): void {
+            };
+        }
+
+        $currentWorkingDir = getcwd();
+        $restoreWorkingDir = static function () use ($currentWorkingDir, $io): void {
+            chdir($currentWorkingDir);
+            $io->write(
+                sprintf('Restored working directory to: %s', $currentWorkingDir),
+                verbosity: IOInterface::VERBOSE,
+            );
+        };
+
+        chdir($workingDirOption);
+        $io->write(
+            sprintf('Changed working directory to: %s', $workingDirOption),
+            verbosity: IOInterface::VERBOSE,
+        );
+
+        return $restoreWorkingDir;
+    }
+
+    /** @return array<non-empty-string, non-empty-string> */
+    public static function determineExtensionToPackageSelections(InputInterface $input): array
+    {
+        $extensionToPackageSelections = [];
+        $selectionOptions             = $input->getOption(self::OPTION_PACKAGE_SELECTION);
+        assert(is_array($selectionOptions));
+
+        foreach ($selectionOptions as $selection) {
+            assert(is_string($selection) && $selection !== '');
+            [$extNameString, $packageSelectionString] = explode('=', $selection);
+            Assert::stringNotEmpty($packageSelectionString);
+            $extensionToPackageSelections[ExtensionName::normaliseFromString($extNameString)->name()] = (new RequestedPackageAndVersion($packageSelectionString, null))->package;
+        }
+
+        return $extensionToPackageSelections;
     }
 }

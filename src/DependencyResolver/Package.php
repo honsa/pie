@@ -6,29 +6,41 @@ namespace Php\Pie\DependencyResolver;
 
 use Composer\Package\CompletePackageInterface;
 use InvalidArgumentException;
+use Php\Pie\ComposerIntegration\InstalledJsonMetadata;
 use Php\Pie\ConfigureOption;
 use Php\Pie\Downloading\DownloadUrlMethod;
 use Php\Pie\ExtensionName;
 use Php\Pie\ExtensionType;
+use Php\Pie\File\BinaryFile;
+use Php\Pie\File\BinaryFileFailedVerification;
+use Php\Pie\Platform\OperatingSystem;
 use Php\Pie\Platform\OperatingSystemFamily;
+use Php\Pie\Platform\TargetPlatform;
+use Php\Pie\Util\PackageVerificationStatus;
+use Safe\Exceptions\UrlException;
 use Webmozart\Assert\Assert;
 
 use function array_key_exists;
 use function array_map;
 use function array_slice;
+use function count;
 use function explode;
+use function file_exists;
 use function implode;
-use function parse_url;
+use function is_array;
+use function is_string;
+use function Safe\parse_url;
 use function str_contains;
 use function str_starts_with;
+use function strlen;
 use function strtolower;
+
+use const DIRECTORY_SEPARATOR;
 
 /**
  * @internal This is not public API for PIE, so should not be depended upon unless you accept the risk of BC breaks
  *
  * @immutable
- *
- * @psalm-suppress PropertyNotSetInConstructor
  */
 final class Package
 {
@@ -39,10 +51,12 @@ final class Package
     /** @var non-empty-list<OperatingSystemFamily>|null */
     private array|null $compatibleOsFamilies = null;
     /** @var non-empty-list<OperatingSystemFamily>|null */
-    private array|null $incompatibleOsFamilies        = null;
-    private bool $supportZts                          = true;
-    private bool $supportNts                          = true;
-    private DownloadUrlMethod|null $downloadUrlMethod = null;
+    private array|null $incompatibleOsFamilies = null;
+    private bool $supportZts                   = true;
+    private bool $supportNts                   = true;
+    /** @var non-empty-list<DownloadUrlMethod>|null */
+    private array|null $supportedDownloadUrlMethods = null;
+    private readonly InstalledJsonMetadata $installedJsonMetadata;
 
     public function __construct(
         private readonly CompletePackageInterface $composerPackage,
@@ -52,6 +66,7 @@ final class Package
         private readonly string $version,
         private readonly string|null $downloadUrl,
     ) {
+        $this->installedJsonMetadata = InstalledJsonMetadata::fromComposerPackage($this->composerPackage);
     }
 
     public static function fromComposerCompletePackage(CompletePackageInterface $completePackage): self
@@ -76,7 +91,23 @@ final class Package
 
         $package->supportZts = $phpExtOptions['support-zts'] ?? true;
         $package->supportNts = $phpExtOptions['support-nts'] ?? true;
-        $package->buildPath  = $phpExtOptions['build-path'] ?? null;
+
+        $buildPath = $phpExtOptions['build-path'] ?? null;
+        if ($buildPath !== null) {
+            if (
+                str_starts_with($buildPath, '/')
+                || str_starts_with($buildPath, '\\')
+                || (strlen($buildPath) > 1 && $buildPath[1] === ':')
+            ) {
+                throw new InvalidArgumentException('php-ext.build-path must be a relative path.');
+            }
+
+            if (str_contains($buildPath, '..')) {
+                throw new InvalidArgumentException('php-ext.build-path cannot contain ".." segments.');
+            }
+        }
+
+        $package->buildPath = $buildPath;
 
         $compatibleOsFamilies   = $phpExtOptions['os-families'] ?? null;
         $incompatibleOsFamilies = $phpExtOptions['os-families-exclude'] ?? null;
@@ -91,7 +122,15 @@ final class Package
         $package->priority = $phpExtOptions['priority'] ?? 80;
 
         if ($phpExtOptions !== null && array_key_exists('download-url-method', $phpExtOptions)) {
-            $package->downloadUrlMethod = DownloadUrlMethod::tryFrom($phpExtOptions['download-url-method']);
+            /** @var string|list<string> $extOptionValue */
+            $extOptionValue = $phpExtOptions['download-url-method'];
+            $methods        = is_array($extOptionValue) ? $extOptionValue : [$extOptionValue];
+            if (count($methods) > 0) {
+                $package->supportedDownloadUrlMethods = array_map(
+                    static fn (string $method): DownloadUrlMethod => DownloadUrlMethod::from($method),
+                    $methods,
+                );
+            }
         }
 
         return $package;
@@ -112,8 +151,13 @@ final class Package
             return $this->name;
         }
 
-        $parsed = parse_url($this->downloadUrl);
-        if ($parsed === false || ! array_key_exists('path', $parsed)) {
+        try {
+            $parsed = parse_url($this->downloadUrl);
+        } catch (UrlException) {
+            return $this->name;
+        }
+
+        if (! is_array($parsed) || ! array_key_exists('path', $parsed) || ! is_string($parsed['path'])) {
             return $this->name;
         }
 
@@ -161,6 +205,11 @@ final class Package
     public function extensionName(): ExtensionName
     {
         return $this->extensionName;
+    }
+
+    public function isBundledPhpExtension(): bool
+    {
+        return str_starts_with($this->name(), 'php/');
     }
 
     public function name(): string
@@ -216,8 +265,54 @@ final class Package
         return $this->supportNts;
     }
 
-    public function downloadUrlMethod(): DownloadUrlMethod|null
+    /** @return non-empty-list<DownloadUrlMethod>|null */
+    public function supportedDownloadUrlMethods(): array|null
     {
-        return $this->downloadUrlMethod;
+        return $this->supportedDownloadUrlMethods;
+    }
+
+    public function installedJsonMetadata(): InstalledJsonMetadata
+    {
+        return $this->installedJsonMetadata;
+    }
+
+    public function verifyPackageStatus(TargetPlatform $targetPlatform): PackageVerificationStatus
+    {
+        $extensionPath    = $targetPlatform->phpBinaryPath->extensionPath();
+        $isWindows        = $targetPlatform->operatingSystem === OperatingSystem::Windows;
+        $phpExtensionName = $this->extensionName->name();
+
+        $actualBinaryPathByConvention = $extensionPath . DIRECTORY_SEPARATOR . ($isWindows ? 'php_' : '') . $phpExtensionName . ($isWindows ? '.dll' : '.so');
+
+        // The extension may not be in the usual path (since you can specify a full path to an extension in the INI file)
+        if (! file_exists($actualBinaryPathByConvention)) {
+            return PackageVerificationStatus::ActualBinaryNotFound;
+        }
+
+        $pieExpectedBinaryPath = $this->installedJsonMetadata()->installedBinary();
+        $pieExpectedChecksum   = $this->installedJsonMetadata()->binaryChecksum();
+
+        if ($pieExpectedBinaryPath === null) {
+            return PackageVerificationStatus::InstalledBinaryMetadataMissing;
+        }
+
+        if ($pieExpectedChecksum === null) {
+            return PackageVerificationStatus::ChecksumMetadataMissing;
+        }
+
+        if ($pieExpectedBinaryPath !== $actualBinaryPathByConvention) {
+            return PackageVerificationStatus::InstalledBinaryPathDoesNotMatchActualBinaryPath;
+        }
+
+        $expectedBinaryFileFromMetadata = new BinaryFile($pieExpectedBinaryPath, $pieExpectedChecksum);
+        $actualBinaryFile               = BinaryFile::fromFileWithSha256Checksum($actualBinaryPathByConvention);
+
+        try {
+            $expectedBinaryFileFromMetadata->verifyAgainstOther($actualBinaryFile);
+        } catch (BinaryFileFailedVerification) {
+            return PackageVerificationStatus::ChecksumMismatch;
+        }
+
+        return PackageVerificationStatus::Verified;
     }
 }

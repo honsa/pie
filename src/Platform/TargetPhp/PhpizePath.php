@@ -7,12 +7,11 @@ namespace Php\Pie\Platform\TargetPhp;
 use RuntimeException;
 use Symfony\Component\Process\Process;
 
-use function array_key_exists;
 use function assert;
 use function file_exists;
 use function is_executable;
-use function preg_match;
-use function preg_replace;
+use function Safe\preg_match;
+use function Safe\preg_replace;
 use function trim;
 
 /**
@@ -25,6 +24,32 @@ final class PhpizePath
     /** @param non-empty-string $phpizeBinaryPath */
     public function __construct(public readonly string $phpizeBinaryPath)
     {
+    }
+
+    public static function looksLikeValidPhpize(string $phpizePathToCheck, string|null $forPhpApiVersion = null): bool
+    {
+        $phpizeAttempt = $phpizePathToCheck; // @todo
+        if ($phpizeAttempt === '') {
+            return false;
+        }
+
+        if (! file_exists($phpizeAttempt) || ! is_executable($phpizeAttempt)) {
+            return false;
+        }
+
+        $phpizeProcess = new Process([$phpizeAttempt, '--version']);
+        if ($phpizeProcess->run() !== 0) {
+            return false;
+        }
+
+        if (
+            ! preg_match('/PHP Api Version:\s*(.*)/', $phpizeProcess->getOutput(), $m)
+            || $m[1] === ''
+        ) {
+            return false;
+        }
+
+        return $forPhpApiVersion === null || $forPhpApiVersion === $m[1];
     }
 
     public static function guessFrom(PhpBinaryPath $phpBinaryPath): self
@@ -43,26 +68,9 @@ final class PhpizePath
         $phpizeAttempts[] = preg_replace('((.*)php)', '$1phpize', $phpBinaryPath->phpBinaryPath);
 
         foreach ($phpizeAttempts as $phpizeAttempt) {
-            assert($phpizeAttempt !== null);
             assert($phpizeAttempt !== '');
-            if (! file_exists($phpizeAttempt) || ! is_executable($phpizeAttempt)) {
-                continue;
-            }
 
-            $phpizeProcess = new Process([$phpizeAttempt, '--version']);
-            if ($phpizeProcess->run() !== 0) {
-                continue;
-            }
-
-            if (
-                ! preg_match('/PHP Api Version:\s*(.*)/', $phpizeProcess->getOutput(), $m)
-                || ! array_key_exists(1, $m)
-                || $m[1] === ''
-            ) {
-                continue;
-            }
-
-            if ($expectedApiVersion === $m[1]) {
+            if (self::looksLikeValidPhpize($phpizeAttempt, $expectedApiVersion)) {
                 return new self($phpizeAttempt);
             }
         }

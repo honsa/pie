@@ -4,15 +4,20 @@ declare(strict_types=1);
 
 namespace Php\Pie\File;
 
-use Php\Pie\Util\CaptureErrors;
+use Php\Pie\Platform;
 use Php\Pie\Util\Process;
+use Safe\Exceptions\FilesystemException;
+use Symfony\Component\Process\Exception\ProcessFailedException;
 
 use function dirname;
 use function file_exists;
-use function file_put_contents;
+use function is_dir;
 use function is_writable;
+use function Safe\file_put_contents;
+use function Safe\mkdir;
+use function Safe\preg_match;
+use function Safe\tempnam;
 use function sys_get_temp_dir;
-use function tempnam;
 
 /** @internal This is not public API for PIE, so should not be depended upon unless you accept the risk of BC breaks */
 final class SudoFilePut
@@ -23,21 +28,17 @@ final class SudoFilePut
         $pathWritable = ! file_exists($filename) && file_exists(dirname($filename)) && is_writable(dirname($filename));
 
         if ($fileWritable || $pathWritable) {
-            $capturedErrors  = [];
-            $writeSuccessful = CaptureErrors::for(
-                static fn () => file_put_contents($filename, $content),
-                $capturedErrors,
-            );
-
-            if ($writeSuccessful === false) {
-                throw FailedToWriteFile::fromFilePutContentErrors($filename, $capturedErrors);
+            try {
+                file_put_contents($filename, $content);
+            } catch (FilesystemException $e) {
+                throw FailedToWriteFile::fromFilePutContentError($filename, $e);
             }
 
             return;
         }
 
         if (! Sudo::exists()) {
-            throw FailedToWriteFile::fromNoPermissions($filename);
+            throw FailedToWriteFile::fromNoPermissions($filename, null);
         }
 
         self::writeWithSudo($filename, $content);
@@ -45,26 +46,60 @@ final class SudoFilePut
 
     private static function writeWithSudo(string $filename, string $content): void
     {
-        $tempFilename = tempnam(sys_get_temp_dir(), 'pie_tmp_');
-        if ($tempFilename === false) {
-            throw FailedToWriteFile::fromNoPermissions($filename);
+        $tempDir = Platform::getPieBaseWorkingDirectory() . '/tmp';
+        if (! is_dir($tempDir)) {
+            mkdir($tempDir, 0700, true);
         }
 
-        $capturedErrors  = [];
-        $writeSuccessful = CaptureErrors::for(
-            static fn () => file_put_contents($tempFilename, $content),
-            $capturedErrors,
-        );
+        try {
+            $tempFilename = tempnam(sys_get_temp_dir(), 'pie_tmp_');
+        } catch (FilesystemException $e) {
+            throw FailedToWriteFile::fromNoPermissions($filename, $e);
+        }
 
-        if ($writeSuccessful === false) {
-            throw FailedToWriteFile::fromFilePutContentErrors($tempFilename, $capturedErrors);
+        try {
+            file_put_contents($tempFilename, $content);
+        } catch (FilesystemException $e) {
+            throw FailedToWriteFile::fromFilePutContentError($tempFilename, $e);
         }
 
         if (file_exists($filename)) {
-            Process::run([Sudo::find(), 'chmod', '--reference=' . $filename, $tempFilename]);
-            Process::run([Sudo::find(), 'chown', '--reference=' . $filename, $tempFilename]);
+            self::copyOwnership($filename, $tempFilename);
         }
 
-        Process::run([Sudo::find(), 'mv', $tempFilename, $filename]);
+        Process::run([Sudo::find(), 'mv', $tempFilename, $filename], timeout: Process::SHORT_TIMEOUT);
+    }
+
+    /**
+     * Attempt to copy the ownership details (uid/gid) from the source to the
+     * given target file.
+     */
+    private static function copyOwnership(string $sourceFile, string $targetFile): void
+    {
+        try {
+            // GNU chmod supports `--reference`, so try this first
+            Process::run([Sudo::find(), 'chmod', '--reference=' . $sourceFile, $targetFile], timeout: Process::SHORT_TIMEOUT);
+
+            return;
+        } catch (ProcessFailedException) {
+            // Fall back to using `stat` to determine uid/gid
+            try {
+                // Try using GNU stat (-c) first
+                $userAndGroup = Process::run(['stat', '-c', '%u:%g', $sourceFile]);
+            } catch (ProcessFailedException) {
+                try {
+                    // Fall back to using OSX stat (-f)
+                    $userAndGroup = Process::run(['stat', '-f', '%u:%g', $sourceFile]);
+                } catch (ProcessFailedException) {
+                    return;
+                }
+            }
+
+            if (empty($userAndGroup) || ! preg_match('/^\d+:\d+$/', $userAndGroup)) {
+                return;
+            }
+
+            Process::run([Sudo::find(), 'chown', $userAndGroup, $targetFile], timeout: Process::SHORT_TIMEOUT);
+        }
     }
 }

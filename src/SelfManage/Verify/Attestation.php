@@ -6,7 +6,7 @@ namespace Php\Pie\SelfManage\Verify;
 
 use Webmozart\Assert\Assert;
 
-use function base64_decode;
+use function Safe\base64_decode;
 use function wordwrap;
 
 /** @internal This is not public API for PIE, so should not be depended upon unless you accept the risk of BC breaks */
@@ -56,7 +56,6 @@ final class Attestation
         $decoratedCertificate = "-----BEGIN CERTIFICATE-----\n"
             . wordwrap($attestation['bundle']['verificationMaterial']['certificate']['rawBytes'], 67, "\n", true) . "\n"
             . "-----END CERTIFICATE-----\n";
-        Assert::stringNotEmpty($decoratedCertificate);
 
         $decodedPayload = base64_decode($attestation['bundle']['dsseEnvelope']['payload']);
         Assert::stringNotEmpty($decodedPayload);

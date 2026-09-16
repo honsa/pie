@@ -4,26 +4,32 @@ declare(strict_types=1);
 
 namespace Php\Pie\SelfManage\Verify;
 
+use Composer\IO\IOInterface;
 use Php\Pie\File\BinaryFile;
+use Php\Pie\SelfManage\Update\FetchPieRelease;
 use Php\Pie\SelfManage\Update\ReleaseMetadata;
+use Php\Pie\Util\Emoji;
 use Php\Pie\Util\Process;
-use Symfony\Component\Console\Output\OutputInterface;
 use Symfony\Component\Process\Exception\ProcessFailedException;
 use Symfony\Component\Process\ExecutableFinder;
 
 use function implode;
+use function sprintf;
+use function str_starts_with;
 
 /** @internal This is not public API for PIE, so should not be depended upon unless you accept the risk of BC breaks */
 final class GithubCliAttestationVerification implements VerifyPiePhar
 {
-    private const GH_CLI_NAME             = 'gh';
-    private const GH_VERIFICATION_TIMEOUT = 30;
+    private const GH_CLI_NAME            = 'gh';
+    private const GH_ATTESTATION_COMMAND = 'attestation';
 
-    public function __construct(private readonly ExecutableFinder $executableFinder)
-    {
+    public function __construct(
+        private readonly ExecutableFinder $executableFinder,
+        private readonly FetchPieRelease $fetchPieRelease,
+    ) {
     }
 
-    public function verify(ReleaseMetadata $releaseMetadata, BinaryFile $pharFilename, OutputInterface $output): void
+    public function verify(ReleaseMetadata $releaseMetadata, BinaryFile $pharFilename, IOInterface $io): void
     {
         $gh = $this->executableFinder->find(self::GH_CLI_NAME);
 
@@ -31,22 +37,44 @@ final class GithubCliAttestationVerification implements VerifyPiePhar
             throw GithubCliNotAvailable::fromExpectedGhToolName(self::GH_CLI_NAME);
         }
 
+        // Try to use `gh attestation --help` to ensure it is not an old `gh` cli version
+        try {
+            Process::run([$gh, self::GH_ATTESTATION_COMMAND, '--help']);
+        } catch (ProcessFailedException $attestationCommandCheck) {
+            if (str_starts_with($attestationCommandCheck->getProcess()->getErrorOutput(), sprintf('unknown command "%s" for "%s"', self::GH_ATTESTATION_COMMAND, self::GH_CLI_NAME))) {
+                throw GithubCliNotAvailable::withMissingAttestationCommand(self::GH_CLI_NAME);
+            }
+
+            throw $attestationCommandCheck;
+        }
+
         $verificationCommand = [
             $gh,
-            'attestation',
+            self::GH_ATTESTATION_COMMAND,
             'verify',
-            '--owner=php',
-            $pharFilename->filePath,
+            '--repo=php/pie',
         ];
 
-        $output->writeln('Verifying using: ' . implode(' ', $verificationCommand), OutputInterface::VERBOSITY_VERBOSE);
+        if ($releaseMetadata->tag === 'nightly') {
+            $verificationCommand[] = '--signer-workflow=php/pie/.github/workflows/build-assets.yml';
+            $verificationCommand[] = '--source-ref=refs/heads/' . $this->fetchPieRelease->trunkBranch();
+        } else {
+            $verificationCommand[] = '--source-ref=refs/tags/' . $releaseMetadata->tag;
+        }
+
+        $verificationCommand[] = $pharFilename->filePath;
+
+        $io->write(
+            'Verifying using: ' . implode(' ', $verificationCommand),
+            verbosity: IOInterface::VERBOSE,
+        );
 
         try {
-            Process::run($verificationCommand, null, self::GH_VERIFICATION_TIMEOUT);
+            Process::run($verificationCommand);
         } catch (ProcessFailedException $processFailedException) {
             throw FailedToVerifyRelease::fromGhCliFailure($releaseMetadata, $processFailedException);
         }
 
-        $output->writeln('<info>✅ Verified the new PIE version</info>');
+        $io->write(sprintf('<info>%s Verified the new PIE version</info>', Emoji::GREEN_CHECKMARK));
     }
 }

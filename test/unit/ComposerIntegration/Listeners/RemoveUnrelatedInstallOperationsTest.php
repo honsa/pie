@@ -7,6 +7,7 @@ namespace Php\PieUnitTest\ComposerIntegration\Listeners;
 use Composer\Composer;
 use Composer\DependencyResolver\Operation\InstallOperation;
 use Composer\DependencyResolver\Operation\OperationInterface;
+use Composer\DependencyResolver\Operation\UpdateOperation;
 use Composer\DependencyResolver\Transaction;
 use Composer\EventDispatcher\EventDispatcher;
 use Composer\Installer\InstallerEvent;
@@ -27,7 +28,6 @@ use Php\Pie\Platform\WindowsCompiler;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\MockObject\MockObject;
 use PHPUnit\Framework\TestCase;
-use Symfony\Component\Console\Output\OutputInterface;
 
 use function array_filter;
 use function array_map;
@@ -63,7 +63,7 @@ final class RemoveUnrelatedInstallOperationsTest extends TestCase
         RemoveUnrelatedInstallOperations::selfRegister(
             $this->composer,
             new PieComposerRequest(
-                $this->createMock(OutputInterface::class),
+                $this->createMock(IOInterface::class),
                 new TargetPlatform(
                     OperatingSystem::NonWindows,
                     OperatingSystemFamily::Linux,
@@ -72,27 +72,22 @@ final class RemoveUnrelatedInstallOperationsTest extends TestCase
                     ThreadSafetyMode::NonThreadSafe,
                     1,
                     WindowsCompiler::VC15,
+                    null,
                 ),
-                new RequestedPackageAndVersion('foo/bar', '^1.1'),
+                [new RequestedPackageAndVersion('foo/bar', '^1.1')],
                 PieOperation::Install,
                 [],
-                null,
                 false,
             ),
         );
     }
 
-    /** @psalm-suppress InternalMethod */
     public function testUnrelatedInstallOperationsAreRemoved(): void
     {
         $composerPackage1 = new CompletePackage('foo/bar', '1.2.3.0', '1.2.3');
         $composerPackage2 = new CompletePackage('bat/baz', '3.4.5.0', '3.4.5');
         $composerPackage3 = new CompletePackage('qux/quux', '5.6.7.0', '5.6.7');
 
-        /**
-         * @psalm-suppress InternalClass
-         * @psalm-suppress InternalMethod
-         */
         $installerEvent = new InstallerEvent(
             InstallerEvents::PRE_OPERATIONS_EXEC,
             $this->composer,
@@ -104,7 +99,7 @@ final class RemoveUnrelatedInstallOperationsTest extends TestCase
 
         (new RemoveUnrelatedInstallOperations(
             new PieComposerRequest(
-                $this->createMock(OutputInterface::class),
+                $this->createMock(IOInterface::class),
                 new TargetPlatform(
                     OperatingSystem::Windows,
                     OperatingSystemFamily::Linux,
@@ -113,11 +108,11 @@ final class RemoveUnrelatedInstallOperationsTest extends TestCase
                     ThreadSafetyMode::NonThreadSafe,
                     1,
                     WindowsCompiler::VC15,
+                    null,
                 ),
-                new RequestedPackageAndVersion('bat/baz', '^3.2'),
+                [new RequestedPackageAndVersion('bat/baz', '^3.2')],
                 PieOperation::Install,
                 [],
-                null,
                 false,
             ),
         ))($installerEvent);
@@ -129,6 +124,62 @@ final class RemoveUnrelatedInstallOperationsTest extends TestCase
                 array_filter(
                     $installerEvent->getTransaction()?->getOperations() ?? [],
                     static fn (OperationInterface $operation): bool => $operation instanceof InstallOperation,
+                ),
+            ),
+        );
+    }
+
+    public function testUnrelatedUpdateOperationsAreRemoved(): void
+    {
+        $keepInitial    = new CompletePackage('bat/baz', '3.4.5.0', '3.4.5');
+        $keepTarget     = new CompletePackage('bat/baz', '3.5.0.0', '3.5.0');
+        $discardInitial = new CompletePackage('foo/bar', '1.2.3.0', '1.2.3');
+        $discardTarget  = new CompletePackage('foo/bar', '1.3.0.0', '1.3.0');
+
+        $installerEvent = new InstallerEvent(
+            InstallerEvents::PRE_OPERATIONS_EXEC,
+            $this->composer,
+            $this->createMock(IOInterface::class),
+            false,
+            true,
+            new Transaction([$keepInitial, $discardInitial], [$keepTarget, $discardTarget]),
+        );
+
+        self::assertSame(
+            [UpdateOperation::class, UpdateOperation::class],
+            array_map(
+                static fn (object $operation): string => $operation::class,
+                $installerEvent->getTransaction()?->getOperations() ?? [],
+            ),
+        );
+
+        (new RemoveUnrelatedInstallOperations(
+            new PieComposerRequest(
+                $this->createMock(IOInterface::class),
+                new TargetPlatform(
+                    OperatingSystem::Windows,
+                    OperatingSystemFamily::Linux,
+                    PhpBinaryPath::fromCurrentProcess(),
+                    Architecture::x86_64,
+                    ThreadSafetyMode::NonThreadSafe,
+                    1,
+                    WindowsCompiler::VC15,
+                    null,
+                ),
+                [new RequestedPackageAndVersion('bat/baz', '^3.2')],
+                PieOperation::Install,
+                [],
+                false,
+            ),
+        ))($installerEvent);
+
+        self::assertSame(
+            ['bat/baz'],
+            array_map(
+                static fn (UpdateOperation $operation): string => $operation->getTargetPackage()->getName(),
+                array_filter(
+                    $installerEvent->getTransaction()?->getOperations() ?? [],
+                    static fn (OperationInterface $operation): bool => $operation instanceof UpdateOperation,
                 ),
             ),
         );

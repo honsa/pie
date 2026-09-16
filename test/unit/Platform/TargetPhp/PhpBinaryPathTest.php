@@ -4,18 +4,23 @@ declare(strict_types=1);
 
 namespace Php\PieUnitTest\Platform\TargetPhp;
 
+use Composer\IO\BufferIO;
 use Composer\Util\Platform;
 use Php\Pie\ExtensionName;
 use Php\Pie\Platform\Architecture;
+use Php\Pie\Platform\DebugBuild;
 use Php\Pie\Platform\OperatingSystem;
 use Php\Pie\Platform\OperatingSystemFamily;
 use Php\Pie\Platform\TargetPhp\Exception\ExtensionIsNotLoaded;
 use Php\Pie\Platform\TargetPhp\Exception\InvalidPhpBinaryPath;
 use Php\Pie\Platform\TargetPhp\PhpBinaryPath;
+use Php\Pie\Util\Process;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\DataProvider;
+use PHPUnit\Framework\Attributes\RequiresOperatingSystemFamily;
 use PHPUnit\Framework\TestCase;
-use Symfony\Component\Console\Output\BufferedOutput;
+use ReflectionMethod;
+use Symfony\Component\Console\Output\OutputInterface;
 use Symfony\Component\Process\PhpExecutableFinder;
 
 use function array_column;
@@ -30,13 +35,20 @@ use function defined;
 use function dirname;
 use function file_exists;
 use function get_loaded_extensions;
-use function ini_get;
 use function is_dir;
 use function is_executable;
-use function php_uname;
 use function phpversion;
+use function Safe\chmod;
+use function Safe\file_put_contents;
+use function Safe\ini_get;
+use function Safe\mkdir;
+use function Safe\tempnam;
+use function Safe\unlink;
 use function sprintf;
 use function strtolower;
+use function sys_get_temp_dir;
+use function trim;
+use function uniqid;
 
 use const DIRECTORY_SEPARATOR;
 use const PHP_INT_SIZE;
@@ -48,7 +60,9 @@ use const PHP_RELEASE_VERSION;
 #[CoversClass(PhpBinaryPath::class)]
 final class PhpBinaryPathTest extends TestCase
 {
-    private const FAKE_PHP_EXECUTABLE = __DIR__ . '/../../../assets/fake-php.sh';
+    private const FAKE_PHP_EXECUTABLE     = __DIR__ . '/../../../assets/fake-php.sh';
+    private const PHP_INVALID_VERSION     = __DIR__ . '/../../../assets/fake-php-invalid-version.sh';
+    private const VALID_PHP_WITH_WARNINGS = __DIR__ . '/../../../assets/valid-php-with-warnings.sh';
 
     public function testNonExistentPhpBinaryIsRejected(): void
     {
@@ -76,6 +90,7 @@ final class PhpBinaryPathTest extends TestCase
         PhpBinaryPath::fromPhpBinaryPath(__FILE__);
     }
 
+    #[RequiresOperatingSystemFamily('Linux')]
     public function testInvalidPhpBinaryIsRejected(): void
     {
         $this->expectException(InvalidPhpBinaryPath::class);
@@ -83,15 +98,39 @@ final class PhpBinaryPathTest extends TestCase
         PhpBinaryPath::fromPhpBinaryPath(self::FAKE_PHP_EXECUTABLE);
     }
 
+    #[RequiresOperatingSystemFamily('Linux')]
+    public function testInvalidVersion(): void
+    {
+        $phpBinary = PhpBinaryPath::fromPhpBinaryPath(self::PHP_INVALID_VERSION);
+        self::assertSame('5.6.40', $phpBinary->version());
+        self::assertSame('5.6', $phpBinary->majorMinorVersion());
+    }
+
+    public function testWarningsAndDeprecationsAreFiltered(): void
+    {
+        if (Platform::isWindows()) {
+            self::markTestSkipped('Bash script does not run on Windows.');
+        }
+
+        $phpBinary = PhpBinaryPath::fromPhpBinaryPath(self::VALID_PHP_WITH_WARNINGS);
+        self::assertSame(self::VALID_PHP_WITH_WARNINGS, $phpBinary->phpBinaryPath);
+    }
+
     public function testVersionFromCurrentProcess(): void
     {
         $phpBinary = PhpBinaryPath::fromCurrentProcess();
 
         self::assertSame(
-            sprintf('%s.%s.%s', PHP_MAJOR_VERSION, PHP_MINOR_VERSION, PHP_RELEASE_VERSION),
+            PHP_MAJOR_VERSION . '.' . PHP_MINOR_VERSION . '.' . PHP_RELEASE_VERSION,
             $phpBinary->version(),
         );
-        self::assertNull($phpBinary->phpConfigPath());
+
+        $phpConfig = $phpBinary->phpConfigPath();
+        if ($phpConfig === null) {
+            return;
+        }
+
+        self::assertSame($phpBinary->phpBinaryPath, Process::run([$phpConfig, '--php-binary']));
     }
 
     /** @return array<string, array{0: non-empty-string, 1: non-empty-string}> */
@@ -104,15 +143,25 @@ final class PhpBinaryPathTest extends TestCase
 
         $possiblePhpConfigPaths = array_filter(
             [
+                ['/usr/bin/php-config8.5', '8.5'],
+                ['/usr/bin/php-config8.4', '8.4'],
                 ['/usr/bin/php-config8.3', '8.3'],
                 ['/usr/bin/php-config8.2', '8.2'],
                 ['/usr/bin/php-config8.1', '8.1'],
                 ['/usr/bin/php-config8.0', '8.0'],
                 ['/usr/bin/php-config7.4', '7.4'],
+                ['/usr/bin/php-config7.3', '7.3'],
+                ['/usr/bin/php-config7.2', '7.2'],
+                ['/usr/bin/php-config7.1', '7.1'],
+                ['/usr/bin/php-config5.6', '5.6'],
             ],
             static fn (array $phpConfigPath) => file_exists($phpConfigPath[0])
                 && is_executable($phpConfigPath[0]),
         );
+
+        if ($possiblePhpConfigPaths === []) {
+            return ['skip' => ['skip', 'skip']];
+        }
 
         return array_combine(
             array_column($possiblePhpConfigPaths, 0),
@@ -127,6 +176,10 @@ final class PhpBinaryPathTest extends TestCase
             self::markTestSkipped('Do not need to test php-config on Windows as we are not building on Windows.');
         }
 
+        if ($expectedMajorMinor === 'skip') {
+            self::markTestSkipped('No known system php-config could be found.');
+        }
+
         assert($phpConfigPath !== '');
         $phpBinary = PhpBinaryPath::fromPhpConfigExecutable($phpConfigPath);
 
@@ -135,7 +188,27 @@ final class PhpBinaryPathTest extends TestCase
             $phpBinary->majorMinorVersion(),
         );
 
+        self::assertStringStartsWith(
+            $expectedMajorMinor . '.',
+            $phpBinary->version(),
+        );
+
         self::assertSame($phpConfigPath, $phpBinary->phpConfigPath());
+
+        self::assertSame(
+            Process::run([$phpConfigPath, '--extension-dir']),
+            $phpBinary->phpConfigExtensionPath(),
+        );
+    }
+
+    public function testPhpConfigExtensionPathIsNullWhenPhpConfigIsNotPresent(): void
+    {
+        $phpExecutable = trim((string) (new PhpExecutableFinder())->find());
+        assert($phpExecutable !== '');
+
+        $phpBinary = PhpBinaryPath::fromPhpBinaryPath($phpExecutable);
+
+        self::assertNull($phpBinary->phpConfigExtensionPath());
     }
 
     public function testExtensions(): void
@@ -186,15 +259,46 @@ final class PhpBinaryPathTest extends TestCase
         );
     }
 
-    public function testMachineType(): void
+    /** @return list<array{0: OperatingSystem, 1: string, 2: string, 3: int, 4: Architecture}> */
+    public static function machineTypeProvider(): array
     {
-        $myUnameMachineType = php_uname('m');
-        assert($myUnameMachineType !== '');
-        self::assertSame(
-            Architecture::parseArchitecture($myUnameMachineType),
-            PhpBinaryPath::fromCurrentProcess()
-                ->machineType(),
-        );
+        return [
+            // x86 (32-bit)
+            [OperatingSystem::Windows, 'Architecture => x32', '', 4, Architecture::x86],
+            [OperatingSystem::NonWindows, 'Architecture => x86', 'x86', 4, Architecture::x86],
+            [OperatingSystem::NonWindows, '', 'x86', 4, Architecture::x86],
+
+            // x86_64 (64-bit)
+            [OperatingSystem::Windows, 'Architecture => x64', 'AMD64', 8, Architecture::x86_64],
+            [OperatingSystem::Windows, 'Architecture => x64', '', 8, Architecture::x86_64],
+            [OperatingSystem::NonWindows, 'Architecture => x86_64', 'x86_64', 8, Architecture::x86_64],
+            [OperatingSystem::NonWindows, '', 'x86_64', 8, Architecture::x86_64],
+
+            // arm64
+            [OperatingSystem::NonWindows, 'Architecture => arm64', 'arm64', 8, Architecture::arm64],
+            [OperatingSystem::NonWindows, '', 'arm64', 8, Architecture::arm64],
+            [OperatingSystem::NonWindows, 'Architecture => aarch64', 'aarch64', 8, Architecture::arm64],
+            [OperatingSystem::NonWindows, '', 'aarch64', 8, Architecture::arm64],
+        ];
+    }
+
+    #[RequiresOperatingSystemFamily('Linux')]
+    #[DataProvider('machineTypeProvider')]
+    public function testMachineType(OperatingSystem $os, string $phpinfo, string $uname, int $phpIntSize, Architecture $expectedArchitecture): void
+    {
+        $tmpSh = tempnam(sys_get_temp_dir(), uniqid('pie_machine_type_test'));
+        file_put_contents($tmpSh, "#!/usr/bin/env bash\necho \"" . $uname . "\";\n");
+        chmod($tmpSh, 0777);
+
+        $phpBinary = $this->createPartialMock(PhpBinaryPath::class, ['operatingSystem', 'phpinfo', 'phpIntSize']);
+        (new ReflectionMethod($phpBinary, '__construct'))->invoke($phpBinary, $tmpSh, null);
+
+        $phpBinary->method('operatingSystem')->willReturn($os);
+        $phpBinary->method('phpinfo')->willReturn($phpinfo);
+        $phpBinary->method('phpIntSize')->willReturn($phpIntSize);
+
+        self::assertEquals($expectedArchitecture, $phpBinary->machineType());
+        unlink($tmpSh);
     }
 
     public function testPhpIntSize(): void
@@ -206,11 +310,44 @@ final class PhpBinaryPathTest extends TestCase
         );
     }
 
-    public function testExtensionPath(): void
+    #[RequiresOperatingSystemFamily('Linux')]
+    public function testExtensionPathOnLinuxThatAlreadyExists(): void
     {
         $phpBinary = PhpBinaryPath::fromCurrentProcess();
 
-        $expectedExtensionDir = ini_get('extension_dir');
+        $expectedExtensionDir = (string) ini_get('extension_dir');
+        self::assertNotEmpty($expectedExtensionDir);
+        self::assertDirectoryExists($expectedExtensionDir);
+
+        self::assertSame(
+            $expectedExtensionDir,
+            $phpBinary->extensionPath(),
+        );
+    }
+
+    #[RequiresOperatingSystemFamily('Linux')]
+    public function testExtensionPathWithInstallRootPrefixOnLinuxThatAlreadyExists(): void
+    {
+        $installRoot = '/tmp/' . uniqid('pie-test-install-root-existing-', true);
+        $phpBinary   = PhpBinaryPath::fromCurrentProcess();
+
+        $expectedExtensionDir = $installRoot . ini_get('extension_dir');
+        mkdir($expectedExtensionDir, 0777, true);
+        self::assertDirectoryExists($expectedExtensionDir);
+
+        self::assertSame(
+            $expectedExtensionDir,
+            $phpBinary->extensionPath($installRoot),
+        );
+    }
+
+    #[RequiresOperatingSystemFamily('Windows')]
+    public function testExtensionPathOnWindows(): void
+    {
+        $phpBinary = PhpBinaryPath::fromCurrentProcess();
+
+        $expectedExtensionDir = (string) ini_get('extension_dir');
+        self::assertNotEmpty($expectedExtensionDir);
 
         // `extension_dir` may be a relative URL on Windows (e.g. "ext"), so resolve it according to the location of PHP
         if (! file_exists($expectedExtensionDir) || ! is_dir($expectedExtensionDir)) {
@@ -224,6 +361,57 @@ final class PhpBinaryPathTest extends TestCase
             $expectedExtensionDir,
             $phpBinary->extensionPath(),
         );
+    }
+
+    #[RequiresOperatingSystemFamily('Windows')]
+    public function testRelativeExtensionPathOnWindowsIsFilled(): void
+    {
+        $phpBinary = $this->createPartialMock(PhpBinaryPath::class, ['phpinfo']);
+        (new ReflectionMethod($phpBinary, '__construct'))
+            ->invoke($phpBinary, trim((string) (new PhpExecutableFinder())->find()), null);
+
+        $configuredExtensionPath = 'foo';
+        self::assertDirectoryDoesNotExist($configuredExtensionPath, 'test cannot run if the same-named extension dir already exists in cwd');
+
+        $fullExtensionPath = dirname($phpBinary->phpBinaryPath) . DIRECTORY_SEPARATOR . $configuredExtensionPath;
+        mkdir($fullExtensionPath, 0777, true);
+        self::assertDirectoryExists($fullExtensionPath);
+
+        $phpBinary->expects(self::once())
+            ->method('phpinfo')
+            ->willReturn(sprintf('extension_dir => %s => %s', $configuredExtensionPath, $configuredExtensionPath));
+
+        self::assertSame($fullExtensionPath, $phpBinary->extensionPath());
+    }
+
+    public function testExtensionPathIsImplicitlyCreated(): void
+    {
+        $phpBinary = $this->createPartialMock(PhpBinaryPath::class, ['phpinfo']);
+        (new ReflectionMethod($phpBinary, '__construct'))
+            ->invoke($phpBinary, trim((string) (new PhpExecutableFinder())->find()), null);
+
+        $configuredExtensionPath = sys_get_temp_dir() . DIRECTORY_SEPARATOR . uniqid('PIE_non_existent_extension_path', true);
+        self::assertDirectoryDoesNotExist($configuredExtensionPath);
+
+        $phpBinary->expects(self::once())
+            ->method('phpinfo')
+            ->willReturn(sprintf('extension_dir => %s => %s', $configuredExtensionPath, $configuredExtensionPath));
+
+        self::assertSame($configuredExtensionPath, $phpBinary->extensionPath());
+        self::assertDirectoryExists($configuredExtensionPath);
+    }
+
+    #[RequiresOperatingSystemFamily('Linux')]
+    public function testExtensionPathWithInstallRootPrefixIsImplicitlyCreated(): void
+    {
+        $installRoot = '/tmp/' . uniqid('pie-test-install-root-not-existing-', true);
+        $phpBinary   = PhpBinaryPath::fromCurrentProcess();
+
+        $expectedExtensionDir = $installRoot . ini_get('extension_dir');
+        self::assertDirectoryDoesNotExist($expectedExtensionDir);
+
+        self::assertSame($expectedExtensionDir, $phpBinary->extensionPath($installRoot));
+        self::assertDirectoryExists($expectedExtensionDir);
     }
 
     /** @return array<string, array{0: string}> */
@@ -261,10 +449,8 @@ final class PhpBinaryPathTest extends TestCase
         $php = PhpBinaryPath::fromPhpBinaryPath($phpPath);
         self::assertArrayHasKey('Core', $php->extensions());
         self::assertNotEmpty($php->extensionPath());
-        self::assertInstanceOf(OperatingSystem::class, $php->operatingSystem());
         self::assertNotEmpty($php->version());
         self::assertNotEmpty($php->majorMinorVersion());
-        self::assertInstanceOf(Architecture::class, $php->machineType());
         self::assertGreaterThan(0, $php->phpIntSize());
         self::assertNotEmpty($php->phpinfo());
     }
@@ -278,12 +464,12 @@ final class PhpBinaryPathTest extends TestCase
             self::fail('Core extension is not loaded, this is quite unexpected...');
         }
 
-        $output = new BufferedOutput(BufferedOutput::VERBOSITY_VERBOSE);
-        $php->assertExtensionIsLoadedInRuntime(ExtensionName::normaliseFromString('Core'), $output);
+        $io = new BufferIO(verbosity: OutputInterface::VERBOSITY_VERBOSE);
+        $php->assertExtensionIsLoadedInRuntime(ExtensionName::normaliseFromString('Core'), $io);
 
         self::assertStringContainsString(
             'Successfully asserted that extension Core is loaded in runtime.',
-            $output->fetch(),
+            $io->getOutput(),
         );
     }
 
@@ -296,12 +482,12 @@ final class PhpBinaryPathTest extends TestCase
             self::fail('Core extension is not loaded, this is quite unexpected...');
         }
 
-        $output = new BufferedOutput(BufferedOutput::VERBOSITY_VERBOSE);
-        $php->assertExtensionIsLoadedInRuntime(ExtensionName::normaliseFromString('CORE'), $output);
+        $io = new BufferIO(verbosity: OutputInterface::VERBOSITY_VERBOSE);
+        $php->assertExtensionIsLoadedInRuntime(ExtensionName::normaliseFromString('CORE'), $io);
 
         self::assertStringContainsString(
             'Successfully asserted that extension CORE is loaded in runtime.',
-            $output->fetch(),
+            $io->getOutput(),
         );
     }
 
@@ -313,5 +499,49 @@ final class PhpBinaryPathTest extends TestCase
         $php->assertExtensionIsLoadedInRuntime(ExtensionName::normaliseFromString(
             'hopefully_this_extension_name_is_not_real_otherwise_this_test_will_fail',
         ));
+    }
+
+    public function testBuildProviderWhenConfigured(): void
+    {
+        $phpBinary = $this->createPartialMock(PhpBinaryPath::class, ['phpinfo']);
+
+        $phpBinary->expects(self::once())
+            ->method('phpinfo')
+            ->willReturn('Build Provider => My build provider');
+
+        self::assertSame('My build provider', $phpBinary->buildProvider());
+    }
+
+    public function testBuildProviderNullWhenNotConfigured(): void
+    {
+        $phpBinary = $this->createPartialMock(PhpBinaryPath::class, ['phpinfo']);
+
+        $phpBinary->expects(self::once())
+            ->method('phpinfo')
+            ->willReturn('');
+
+        self::assertNull($phpBinary->buildProvider());
+    }
+
+    public function testDebugBuildModeReturnsDebugWhenYes(): void
+    {
+        $phpBinary = $this->createPartialMock(PhpBinaryPath::class, ['phpinfo']);
+
+        $phpBinary->expects(self::once())
+            ->method('phpinfo')
+            ->willReturn('Debug Build => no');
+
+        self::assertSame(DebugBuild::NoDebug, $phpBinary->debugMode());
+    }
+
+    public function testDebugBuildModeReturnsNoDebugWhenNo(): void
+    {
+        $phpBinary = $this->createPartialMock(PhpBinaryPath::class, ['phpinfo']);
+
+        $phpBinary->expects(self::once())
+            ->method('phpinfo')
+            ->willReturn('Debug Build => yes');
+
+        self::assertSame(DebugBuild::Debug, $phpBinary->debugMode());
     }
 }

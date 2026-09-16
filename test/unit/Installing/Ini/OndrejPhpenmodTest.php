@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace Php\PieUnitTest\Installing\Ini;
 
+use Composer\IO\BufferIO;
+use Composer\IO\IOInterface;
 use Composer\Package\CompletePackageInterface;
 use Php\Pie\DependencyResolver\Package;
 use Php\Pie\Downloading\DownloadedPackage;
@@ -23,14 +25,13 @@ use PHPUnit\Framework\Attributes\RequiresOperatingSystemFamily;
 use PHPUnit\Framework\Constraint\IsType;
 use PHPUnit\Framework\MockObject\MockObject;
 use PHPUnit\Framework\TestCase;
-use Symfony\Component\Console\Output\BufferedOutput;
 use Symfony\Component\Console\Output\OutputInterface;
 
-use function mkdir;
-use function rmdir;
+use function Safe\mkdir;
+use function Safe\rmdir;
+use function Safe\tempnam;
+use function Safe\unlink;
 use function sys_get_temp_dir;
-use function tempnam;
-use function unlink;
 
 use const DIRECTORY_SEPARATOR;
 
@@ -42,7 +43,7 @@ final class OndrejPhpenmodTest extends TestCase
     private const GOOD_PHPENMOD                    = __DIR__ . '/../../../assets/phpenmod/good';
     private const BAD_PHPENMOD                     = __DIR__ . '/../../../assets/phpenmod/bad';
 
-    private BufferedOutput $output;
+    private BufferIO $io;
     private PhpBinaryPath&MockObject $mockPhpBinary;
     private CheckAndAddExtensionToIniIfNeeded&MockObject $checkAndAddExtensionToIniIfNeeded;
     private TargetPlatform $targetPlatform;
@@ -53,13 +54,9 @@ final class OndrejPhpenmodTest extends TestCase
     {
         parent::setUp();
 
-        $this->output = new BufferedOutput(BufferedOutput::VERBOSITY_VERBOSE);
+        $this->io = new BufferIO(verbosity: OutputInterface::VERBOSITY_VERBOSE);
 
         $this->mockPhpBinary = $this->createMock(PhpBinaryPath::class);
-        /**
-         * @psalm-suppress PossiblyNullFunctionCall
-         * @psalm-suppress UndefinedThisPropertyAssignment
-         */
         (fn () => $this->phpBinaryPath = '/path/to/php')
             ->bindTo($this->mockPhpBinary, PhpBinaryPath::class)();
 
@@ -72,6 +69,7 @@ final class OndrejPhpenmodTest extends TestCase
             Architecture::x86_64,
             ThreadSafetyMode::ThreadSafe,
             1,
+            null,
             null,
         );
 
@@ -142,7 +140,7 @@ final class OndrejPhpenmodTest extends TestCase
                 $this->targetPlatform,
                 $this->downloadedPackage,
                 $this->binaryFile,
-                $this->output,
+                $this->io,
             ),
         );
     }
@@ -163,7 +161,7 @@ final class OndrejPhpenmodTest extends TestCase
                 $this->targetPlatform,
                 $this->downloadedPackage,
                 $this->binaryFile,
-                $this->output,
+                $this->io,
             ),
         );
     }
@@ -189,13 +187,13 @@ final class OndrejPhpenmodTest extends TestCase
                 $this->targetPlatform,
                 $this->downloadedPackage,
                 $this->binaryFile,
-                $this->output,
+                $this->io,
             ),
         );
 
         self::assertStringContainsString(
             'Additional INI file path was not set - may not be Ondrej PHP repo',
-            $this->output->fetch(),
+            $this->io->getOutput(),
         );
     }
 
@@ -219,13 +217,13 @@ final class OndrejPhpenmodTest extends TestCase
                 $this->targetPlatform,
                 $this->downloadedPackage,
                 $this->binaryFile,
-                $this->output,
+                $this->io,
             ),
         );
 
         self::assertStringContainsString(
             'Mods available path ' . self::NON_EXISTENT_MODS_AVAILABLE_PATH . ' does not exist',
-            $this->output->fetch(),
+            $this->io->getOutput(),
         );
     }
 
@@ -249,13 +247,13 @@ final class OndrejPhpenmodTest extends TestCase
                 $this->targetPlatform,
                 $this->downloadedPackage,
                 $this->binaryFile,
-                $this->output,
+                $this->io,
             ),
         );
 
         self::assertStringContainsString(
             'Mods available path ' . __FILE__ . ' is not a directory',
-            $this->output->fetch(),
+            $this->io->getOutput(),
         );
     }
 
@@ -283,7 +281,7 @@ final class OndrejPhpenmodTest extends TestCase
                 $expectedIniFile,
                 $this->targetPlatform,
                 $this->downloadedPackage,
-                $this->output,
+                $this->io,
                 self::isType(IsType::TYPE_CALLABLE),
             )
             ->willReturnCallback(
@@ -292,7 +290,7 @@ final class OndrejPhpenmodTest extends TestCase
                     string $iniFile,
                     TargetPlatform $targetPlatform,
                     DownloadedPackage $downloadedPackage,
-                    OutputInterface $output,
+                    IOInterface $io,
                     callable $additionalEnableStep,
                 ): bool {
                     return $additionalEnableStep();
@@ -308,7 +306,7 @@ final class OndrejPhpenmodTest extends TestCase
                 $this->targetPlatform,
                 $this->downloadedPackage,
                 $this->binaryFile,
-                $this->output,
+                $this->io,
             ),
         );
 
@@ -335,7 +333,7 @@ final class OndrejPhpenmodTest extends TestCase
                 $expectedIniFile,
                 $this->targetPlatform,
                 $this->downloadedPackage,
-                $this->output,
+                $this->io,
                 self::isType(IsType::TYPE_CALLABLE),
             )
             ->willReturnCallback(
@@ -344,7 +342,7 @@ final class OndrejPhpenmodTest extends TestCase
                     string $iniFile,
                     TargetPlatform $targetPlatform,
                     DownloadedPackage $downloadedPackage,
-                    OutputInterface $output,
+                    IOInterface $io,
                     callable $additionalEnableStep,
                 ): bool {
                     return $additionalEnableStep();
@@ -360,7 +358,7 @@ final class OndrejPhpenmodTest extends TestCase
                 $this->targetPlatform,
                 $this->downloadedPackage,
                 $this->binaryFile,
-                $this->output,
+                $this->io,
             ),
         );
 
@@ -368,7 +366,7 @@ final class OndrejPhpenmodTest extends TestCase
 
         self::assertStringContainsString(
             'something bad happened',
-            $this->output->fetch(),
+            $this->io->getOutput(),
         );
 
         rmdir($modsAvailablePath);
@@ -394,7 +392,7 @@ final class OndrejPhpenmodTest extends TestCase
                 $expectedIniFile,
                 $this->targetPlatform,
                 $this->downloadedPackage,
-                $this->output,
+                $this->io,
                 self::isType(IsType::TYPE_CALLABLE),
             )
             ->willReturn(false);
@@ -408,7 +406,7 @@ final class OndrejPhpenmodTest extends TestCase
                 $this->targetPlatform,
                 $this->downloadedPackage,
                 $this->binaryFile,
-                $this->output,
+                $this->io,
             ),
         );
 
@@ -437,7 +435,7 @@ final class OndrejPhpenmodTest extends TestCase
                 $expectedIniFile,
                 $this->targetPlatform,
                 $this->downloadedPackage,
-                $this->output,
+                $this->io,
                 self::isType(IsType::TYPE_CALLABLE),
             )
             ->willReturnCallback(
@@ -446,7 +444,7 @@ final class OndrejPhpenmodTest extends TestCase
                     string $iniFile,
                     TargetPlatform $targetPlatform,
                     DownloadedPackage $downloadedPackage,
-                    OutputInterface $output,
+                    IOInterface $io,
                     callable $additionalEnableStep,
                 ): bool {
                     return $additionalEnableStep();
@@ -462,7 +460,7 @@ final class OndrejPhpenmodTest extends TestCase
                 $this->targetPlatform,
                 $this->downloadedPackage,
                 $this->binaryFile,
-                $this->output,
+                $this->io,
             ),
         );
 

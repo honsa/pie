@@ -4,12 +4,12 @@ declare(strict_types=1);
 
 namespace Php\PieIntegrationTest\Downloading;
 
-use Composer\Config;
-use Composer\IO\IOInterface;
-use Composer\Package\CompletePackage;
-use Composer\Util\AuthHelper;
+use Composer\Factory;
+use Composer\IO\NullIO;
+use Composer\Package\CompletePackageInterface;
 use Composer\Util\HttpDownloader;
 use Php\Pie\DependencyResolver\Package;
+use Php\Pie\Downloading\DownloadUrlMethod;
 use Php\Pie\Downloading\GithubPackageReleaseAssets;
 use Php\Pie\ExtensionName;
 use Php\Pie\ExtensionType;
@@ -22,14 +22,13 @@ use Php\Pie\Platform\ThreadSafetyMode;
 use Php\Pie\Platform\WindowsCompiler;
 use Php\Pie\Platform\WindowsExtensionAssetName;
 use PHPUnit\Framework\Attributes\CoversClass;
+use PHPUnit\Framework\Attributes\RequiresOperatingSystemFamily;
 use PHPUnit\Framework\TestCase;
-
-use function getenv;
-use function is_string;
 
 #[CoversClass(GithubPackageReleaseAssets::class)]
 final class GithubPackageReleaseAssetsTest extends TestCase
 {
+    #[RequiresOperatingSystemFamily('Windows')]
     public function testDeterminingReleaseAssetUrlForWindows(): void
     {
         $phpBinaryPath = $this->createMock(PhpBinaryPath::class);
@@ -45,10 +44,11 @@ final class GithubPackageReleaseAssetsTest extends TestCase
             ThreadSafetyMode::ThreadSafe,
             1,
             WindowsCompiler::VS16,
+            null,
         );
 
         $package = new Package(
-            $this->createMock(CompletePackage::class),
+            $this->createMock(CompletePackageInterface::class),
             ExtensionType::PhpModule,
             ExtensionName::normaliseFromString('example_pie_extension'),
             'asgrim/example-pie-extension',
@@ -56,31 +56,23 @@ final class GithubPackageReleaseAssetsTest extends TestCase
             'https://api.github.com/repos/asgrim/example-pie-extension/zipball/f9ed13ea95dada34c6cc5a052da258dbda059d27',
         );
 
-        $io = $this->createMock(IOInterface::class);
+        $io     = new NullIO();
+        $config = Factory::createConfig();
+        $io->loadConfiguration($config);
 
-        $githubToken = getenv('GITHUB_TOKEN');
-        if (is_string($githubToken) && $githubToken !== '') {
-            $io->method('hasAuthentication')
-                ->willReturn(true);
-            $io->method('getAuthentication')
-                ->willReturn(['username' => $githubToken, 'password' => 'x-oauth-basic']);
-        }
-
-        $config = new Config();
-
-        self::assertSame(
-            'https://github.com/asgrim/example-pie-extension/releases/download/2.0.2/php_example_pie_extension-2.0.2-8.3-ts-vs16-x86_64.zip',
+        self::assertMatchesRegularExpression(
+            '~^https://api\.github\.com/repos/asgrim/example-pie-extension/releases/assets/\d+$~',
             (new GithubPackageReleaseAssets('https://api.github.com'))
-                ->findMatchingReleaseAssetUrl(
+                ->findMatchingReleaseAsset(
                     $targetPlatform,
                     $package,
-                    new AuthHelper($io, $config),
                     new HttpDownloader($io, $config),
+                    DownloadUrlMethod::WindowsBinaryDownload,
                     WindowsExtensionAssetName::zipNames(
                         $targetPlatform,
                         $package,
                     ),
-                ),
+                )->url,
         );
     }
 }

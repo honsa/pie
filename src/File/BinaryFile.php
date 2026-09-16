@@ -7,8 +7,9 @@ namespace Php\Pie\File;
 use Php\Pie\Util;
 
 use function file_exists;
+use function hash;
 use function hash_equals;
-use function hash_file;
+use function Safe\hash_file;
 
 /**
  * @internal This is not public API for PIE, so should not be depended upon unless you accept the risk of BC breaks
@@ -44,7 +45,17 @@ final class BinaryFile
             throw Util\FileNotFound::fromFilename($this->filePath);
         }
 
-        self::verifyAgainstOther(self::fromFileWithSha256Checksum($this->filePath));
+        $this->verifyAgainstOther(self::fromFileWithSha256Checksum($this->filePath));
+    }
+
+    /** @throws BinaryFileFailedVerification */
+    public function verifyContent(string $content): void
+    {
+        $contentChecksum = hash(self::HASH_TYPE_SHA256, $content);
+
+        if (! hash_equals($this->checksum, $contentChecksum)) {
+            throw BinaryFileFailedVerification::fromChecksumMismatch($this, new self($this->filePath, $contentChecksum));
+        }
     }
 
     /** @throws BinaryFileFailedVerification */

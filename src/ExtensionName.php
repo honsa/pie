@@ -11,7 +11,7 @@ use Webmozart\Assert\Assert;
 use function array_key_exists;
 use function explode;
 use function is_string;
-use function preg_match;
+use function Safe\preg_match;
 use function sprintf;
 use function str_starts_with;
 use function strlen;
@@ -49,7 +49,7 @@ final class ExtensionName
         $this->normalisedExtensionName = $normalisedExtensionName;
     }
 
-    /** @psalm-assert-if-true non-empty-string $extensionName */
+    /** @phpstan-assert-if-true non-empty-string $extensionName */
     public static function isValidExtensionName(string $extensionName): bool
     {
         return preg_match(self::VALID_PACKAGE_NAME_REGEX, $extensionName) >= 1;
@@ -59,7 +59,6 @@ final class ExtensionName
     {
         $phpExt = $package->getPhpExt();
 
-        /** @psalm-suppress DocblockTypeContradiction just in case runtime type is not correct */
         if (
             $phpExt === null
             || ! array_key_exists('extension-name', $phpExt)
@@ -68,7 +67,6 @@ final class ExtensionName
         ) {
             $packageNameParts = explode('/', $package->getPrettyName());
             Assert::count($packageNameParts, 2, 'Expected a package name like vendor/package for ' . $package->getPrettyName());
-            Assert::keyExists($packageNameParts, 1);
 
             return self::normaliseFromString($packageNameParts[1]);
         }
@@ -95,5 +93,21 @@ final class ExtensionName
     public function nameWithExtPrefix(): string
     {
         return 'ext-' . $this->normalisedExtensionName;
+    }
+
+    /** @return non-empty-string */
+    public function phpFormattedExtensionName(): string
+    {
+        return match ($this->name()) {
+            'core' => 'Core',
+            'spl' => 'SPL',
+            'phar' => 'Phar',
+            'reflection' => 'Reflection',
+            'pdo' => 'PDO',
+            'ffi' => 'FFI',
+            'opcache' => 'Zend OPcache',
+            'simplexml' => 'SimpleXML',
+            default => $this->name(),
+        };
     }
 }

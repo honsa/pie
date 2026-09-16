@@ -4,48 +4,80 @@ declare(strict_types=1);
 
 namespace Php\Pie\Building;
 
+use Composer\IO\IOInterface;
+use LogicException;
+use Php\Pie\ComposerIntegration\BundledPhpExtensionsRepository;
 use Php\Pie\Downloading\DownloadedPackage;
+use Php\Pie\Downloading\DownloadUrlMethod;
 use Php\Pie\File\BinaryFile;
+use Php\Pie\Platform\MakePath;
 use Php\Pie\Platform\TargetPhp\PhpizePath;
 use Php\Pie\Platform\TargetPlatform;
 use Php\Pie\Util\Process;
-use Symfony\Component\Console\Output\OutputInterface;
+use Php\Pie\Util\ProcessFailedWithLimitedOutput;
+use Symfony\Component\Process\Exception\ProcessFailedException;
 use Symfony\Component\Process\Process as SymfonyProcess;
 
 use function count;
 use function file_exists;
 use function implode;
+use function Safe\rename;
 use function sprintf;
+
+use const DIRECTORY_SEPARATOR;
 
 /** @internal This is not public API for PIE, so should not be depended upon unless you accept the risk of BC breaks */
 final class UnixBuild implements Build
 {
-    private const PHPIZE_TIMEOUT_SECS    = 60; // 1 minute
-    private const CONFIGURE_TIMEOUT_SECS = 120; // 2 minutes
-    private const MAKE_TIMEOUT_SECS      = null; // unlimited
-
     /** {@inheritDoc} */
     public function __invoke(
         DownloadedPackage $downloadedPackage,
         TargetPlatform $targetPlatform,
         array $configureOptions,
-        OutputInterface $output,
-        PhpizePath|null $phpizePath,
+        IOInterface $io,
     ): BinaryFile {
-        $outputCallback = null;
-        if ($output->isVerbose()) {
-            /** @var callable(SymfonyProcess::ERR|SymfonyProcess::OUT, string):void $outputCallback */
-            $outputCallback = static function (string $type, string $outputMessage) use ($output): void {
-                $output->write(sprintf(
-                    '%s%s%s',
-                    $type === SymfonyProcess::ERR ? '<comment>' : '',
-                    $outputMessage,
-                    $type === SymfonyProcess::ERR ? '</comment>' : '',
-                ));
-            };
+        $selectedDownloadMethod = DownloadUrlMethod::fromDownloadedPackage($downloadedPackage);
+        switch ($selectedDownloadMethod) {
+            case DownloadUrlMethod::PrePackagedBinary:
+                return $this->prePackagedBinary($downloadedPackage, $io);
+
+            case DownloadUrlMethod::ComposerDefaultDownload:
+            case DownloadUrlMethod::PrePackagedSourceDownload:
+                return $this->buildFromSource($downloadedPackage, $targetPlatform, $configureOptions, $io);
+
+            default:
+                throw new LogicException('Unsupported download method: ' . $selectedDownloadMethod->value);
+        }
+    }
+
+    private function prePackagedBinary(
+        DownloadedPackage $downloadedPackage,
+        IOInterface $io,
+    ): BinaryFile {
+        $expectedSoFile = $downloadedPackage->extractedSourcePath . '/' . $downloadedPackage->package->extensionName()->name() . '.so';
+
+        if (! file_exists($expectedSoFile)) {
+            throw ExtensionBinaryNotFound::fromPrePackagedBinary($expectedSoFile);
         }
 
-        $phpizePath ??= PhpizePath::guessFrom($targetPlatform->phpBinaryPath);
+        $io->write(sprintf(
+            '<info>Pre-packaged binary found:</info> %s',
+            $expectedSoFile,
+        ));
+
+        return BinaryFile::fromFileWithSha256Checksum($expectedSoFile);
+    }
+
+    /** @param list<non-empty-string> $configureOptions */
+    private function buildFromSource(
+        DownloadedPackage $downloadedPackage,
+        TargetPlatform $targetPlatform,
+        array $configureOptions,
+        IOInterface $io,
+    ): BinaryFile {
+        $outputCallback = Process::outputCallbackForVerbosity($io, IOInterface::VERBOSE);
+
+        $phpizePath = $targetPlatform->phpizePath ?? PhpizePath::guessFrom($targetPlatform->phpBinaryPath);
 
         /**
          * Call a cleanup first; most of the time, we expect to be changing a
@@ -53,28 +85,32 @@ final class UnixBuild implements Build
          * already clean anyway; however, sometimes we want to rebuild the
          * current ext, so this will perform a clean first
          */
-        $this->cleanup($phpizePath, $downloadedPackage, $output, $outputCallback);
+        $this->cleanup($phpizePath, $downloadedPackage, $io, $outputCallback);
 
         $this->phpize(
             $phpizePath,
             $downloadedPackage,
-            $output,
+            $io,
             $outputCallback,
         );
 
-        $output->writeln('<info>phpize complete</info>.');
+        $io->write('<info>phpize complete</info>.');
 
         $phpConfigPath = $targetPlatform->phpBinaryPath->phpConfigPath();
         if ($phpConfigPath !== null) {
             $configureOptions[] = '--with-php-config=' . $phpConfigPath;
         }
 
-        $this->configure($downloadedPackage, $configureOptions, $output, $outputCallback);
+        $this->configure($downloadedPackage, $configureOptions, $io, $outputCallback);
 
         $optionsOutput = count($configureOptions) ? ' with options: ' . implode(' ', $configureOptions) : '.';
-        $output->writeln('<info>Configure complete</info>' . $optionsOutput);
+        $io->write('<info>Configure complete</info>' . $optionsOutput);
 
-        $this->make($targetPlatform, $downloadedPackage, $output, $outputCallback);
+        try {
+            $this->make($targetPlatform, $downloadedPackage, $io, $outputCallback);
+        } catch (ProcessFailedException $p) {
+            throw ProcessFailedWithLimitedOutput::fromProcessFailedException($p);
+        }
 
         $expectedSoFile = $downloadedPackage->extractedSourcePath . '/modules/' . $downloadedPackage->package->extensionName()->name() . '.so';
 
@@ -82,7 +118,7 @@ final class UnixBuild implements Build
             throw ExtensionBinaryNotFound::fromExpectedBinary($expectedSoFile);
         }
 
-        $output->writeln(sprintf(
+        $io->write(sprintf(
             '<info>Build complete:</info> %s',
             $expectedSoFile,
         ));
@@ -90,24 +126,45 @@ final class UnixBuild implements Build
         return BinaryFile::fromFileWithSha256Checksum($expectedSoFile);
     }
 
+    private function renamesToConfigM4(DownloadedPackage $downloadedPackage, IOInterface $io): void
+    {
+        $configM4 = $downloadedPackage->extractedSourcePath . DIRECTORY_SEPARATOR . 'config.m4';
+        if (file_exists($configM4)) {
+            return;
+        }
+
+        $io->write('config.m4 does not exist; checking alternatives', verbosity: IOInterface::VERY_VERBOSE);
+        foreach (['config0.m4', 'config9.m4'] as $alternateConfigM4) {
+            $fullPathToAlternate = $downloadedPackage->extractedSourcePath . DIRECTORY_SEPARATOR . $alternateConfigM4;
+            if (file_exists($fullPathToAlternate)) {
+                $io->write(sprintf('Renaming %s to config.m4', $alternateConfigM4), verbosity: IOInterface::VERY_VERBOSE);
+                rename($fullPathToAlternate, $configM4);
+
+                return;
+            }
+        }
+    }
+
     /** @param callable(SymfonyProcess::ERR|SymfonyProcess::OUT, string): void|null $outputCallback */
     private function phpize(
         PhpizePath $phpize,
         DownloadedPackage $downloadedPackage,
-        OutputInterface $output,
+        IOInterface $io,
         callable|null $outputCallback,
     ): void {
         $phpizeCommand = [$phpize->phpizeBinaryPath];
 
-        if ($output->isVerbose()) {
-            $output->writeln('<comment>Running phpize step using: ' . implode(' ', $phpizeCommand) . '</comment>');
-        }
+        $io->write(
+            '<comment>Running phpize step using: ' . implode(' ', $phpizeCommand) . '</comment>',
+            verbosity: IOInterface::VERBOSE,
+        );
+
+        $this->renamesToConfigM4($downloadedPackage, $io);
 
         Process::run(
             $phpizeCommand,
             $downloadedPackage->extractedSourcePath,
-            self::PHPIZE_TIMEOUT_SECS,
-            $outputCallback,
+            outputCallback: $outputCallback,
         );
     }
 
@@ -118,20 +175,20 @@ final class UnixBuild implements Build
     private function configure(
         DownloadedPackage $downloadedPackage,
         array $configureOptions,
-        OutputInterface $output,
+        IOInterface $io,
         callable|null $outputCallback,
     ): void {
         $configureCommand = ['./configure', ...$configureOptions];
 
-        if ($output->isVerbose()) {
-            $output->writeln('<comment>Running configure step with: ' . implode(' ', $configureCommand) . '</comment>');
-        }
+        $io->write(
+            '<comment>Running configure step with: ' . implode(' ', $configureCommand) . '</comment>',
+            verbosity: IOInterface::VERBOSE,
+        );
 
         Process::run(
             $configureCommand,
             $downloadedPackage->extractedSourcePath,
-            self::CONFIGURE_TIMEOUT_SECS,
-            $outputCallback,
+            outputCallback: $outputCallback,
         );
     }
 
@@ -139,26 +196,31 @@ final class UnixBuild implements Build
     private function make(
         TargetPlatform $targetPlatform,
         DownloadedPackage $downloadedPackage,
-        OutputInterface $output,
+        IOInterface $io,
         callable|null $outputCallback,
     ): void {
-        $makeCommand = ['make'];
+        $makeCommand = [MakePath::guess()];
 
         if ($targetPlatform->makeParallelJobs === 1) {
-            $output->writeln('Running make without parallelization - try providing -jN to PIE where N is the number of cores you have.');
+            $io->write('Running make without parallelization - try providing -jN to PIE where N is the number of cores you have.');
         } else {
             $makeCommand[] = sprintf('-j%d', $targetPlatform->makeParallelJobs);
         }
 
-        if ($output->isVerbose()) {
-            $output->writeln('<comment>Running make step with: ' . implode(' ', $makeCommand) . '</comment>');
-        }
+        $makeCommand = BundledPhpExtensionsRepository::augmentMakeCommandForPhpBundledExtensions(
+            $makeCommand,
+            $downloadedPackage,
+        );
+
+        $io->write(
+            '<comment>Running make step with: ' . implode(' ', $makeCommand) . '</comment>',
+            verbosity: IOInterface::VERBOSE,
+        );
 
         Process::run(
             $makeCommand,
             $downloadedPackage->extractedSourcePath,
-            self::MAKE_TIMEOUT_SECS,
-            $outputCallback,
+            outputCallback: $outputCallback,
         );
     }
 
@@ -166,7 +228,7 @@ final class UnixBuild implements Build
     private function cleanup(
         PhpizePath $phpize,
         DownloadedPackage $downloadedPackage,
-        OutputInterface $output,
+        IOInterface $io,
         callable|null $outputCallback,
     ): void {
         /**
@@ -175,26 +237,27 @@ final class UnixBuild implements Build
          * configure script manually...
          */
         if (! file_exists($downloadedPackage->extractedSourcePath . '/configure')) {
-            if ($output->isVerbose()) {
-                $output->writeln('<comment>Skipping phpize --clean, configure does not exist</comment>');
-            }
+            $io->write(
+                '<comment>Skipping phpize --clean, configure does not exist</comment>',
+                verbosity: IOInterface::VERBOSE,
+            );
 
             return;
         }
 
         $phpizeCleanCommand = [$phpize->phpizeBinaryPath, '--clean'];
 
-        if ($output->isVerbose()) {
-            $output->writeln('<comment>Running phpize --clean step using: ' . implode(' ', $phpizeCleanCommand) . '</comment>');
-        }
+        $io->write(
+            '<comment>Running phpize --clean step using: ' . implode(' ', $phpizeCleanCommand) . '</comment>',
+            verbosity: IOInterface::VERBOSE,
+        );
 
         Process::run(
             $phpizeCleanCommand,
             $downloadedPackage->extractedSourcePath,
-            self::PHPIZE_TIMEOUT_SECS,
-            $outputCallback,
+            outputCallback: $outputCallback,
         );
 
-        $output->writeln('<info>Build files cleaned up.</info>');
+        $io->write('<info>Build files cleaned up.</info>');
     }
 }

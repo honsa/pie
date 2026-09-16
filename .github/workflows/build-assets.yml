@@ -1,0 +1,177 @@
+# Invoking this pipeline requires additional permissions, so must be invoked
+# in a way to pass those permissions on, e.g.:
+#
+#  build-assets:
+#    permissions:
+#      contents: read
+#      id-token: write
+#      attestations: write
+#    uses: ./.github/workflows/build-assets.yml
+
+name: "Build the PIE assets"
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  build-phar:
+    runs-on: ${{ matrix.operating-system }}
+    strategy:
+      matrix:
+        operating-system:
+          - ubuntu-latest
+        php-versions:
+          - '8.1'
+    permissions:
+      contents: read
+      # id-token:write is required for build provenance attestation.
+      id-token: write
+      # attestations:write is required for build provenance attestation.
+      attestations: write
+    steps:
+      - name: Setup PHP
+        uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 #2.37.2
+        with:
+          coverage: none
+          tools: composer, box:4.7.x
+          php-version: "${{ matrix.php-version }}"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      # Fixes `git describe` picking the wrong tag - see https://github.com/php/pie/issues/307
+      - run: git fetch --tags --force
+      # Ensure some kind of previous tag exists, otherwise box fails
+      - run: git describe --tags HEAD || git tag 0.0.0
+      - uses: ramsey/composer-install@65e4f84970763564f46a70b8a54b90d033b3bdda #4.0.0
+      - name: Build PHAR
+        run: box compile
+      - name: Check the PHAR executes
+        run: php pie.phar --version
+      - name: Generate build provenance attestation
+        # It does not make sense to do this for PR builds, nor do contributors
+        # have permission to do. We can't write attestations to `php/pie` in an
+        # unprivileged context, otherwise anyone could send a PR with malicious
+        # code, which would store attestation that `php/pie` built the PHAR, and
+        # it would look genuine. So this should NOT run for PR builds.
+        if: github.event_name != 'pull_request' && github.event.repository.visibility == 'public'
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 #v4.2.2
+        with:
+          subject-path: '${{ github.workspace }}/pie.phar'
+      - name: Make SBOM
+        run: composer CycloneDX:make-sbom --output-format=JSON --output-file=sbom.json --omit=dev
+      - name: Attest the SBOM
+        if: github.event_name != 'pull_request' && github.event.repository.visibility == 'public'
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 #v4.2.2
+        with:
+          subject-path: '${{ github.workspace }}/pie.phar'
+          sbom-path: '${{ github.workspace }}/sbom.json'
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a #v7.0.1
+        with:
+          name: pie-${{ github.sha }}.phar
+          path: pie.phar
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a #v7.0.1
+        with:
+          name: pie-${{ github.sha }}-sbom.json
+          path: sbom.json
+
+  build-executable:
+    needs:
+     - build-phar
+    runs-on: ${{ matrix.operating-system }}
+    env:
+      SPC_VERSION: 2.8.5
+    strategy:
+      fail-fast: false
+      matrix:
+        operating-system:
+          - ubuntu-24.04
+          - ubuntu-24.04-arm
+          - macos-26
+          - windows-2022
+    permissions:
+      contents: read
+      # id-token:write is required for build provenance attestation.
+      id-token: write
+      # attestations:write is required for build provenance attestation.
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download SPC (non-Windows)
+        if: runner.os != 'Windows'
+        run: |
+          # @todo find a better way to do this :/
+          # Source URL: https://static-php.dev/en/guide/manual-build.html#build-locally-using-spc-binary-recommended
+          case "${{ matrix.operating-system }}" in
+            ubuntu-24.04)
+              curl -fsSL -o spc.tgz https://github.com/crazywhalecc/static-php-cli/releases/download/${{ env.SPC_VERSION }}/spc-linux-x86_64.tar.gz
+              ;;
+
+            ubuntu-24.04-arm)
+              curl -fsSL -o spc.tgz https://github.com/crazywhalecc/static-php-cli/releases/download/${{ env.SPC_VERSION }}/spc-linux-aarch64.tar.gz
+              ;;
+
+            macos-26)
+              curl -fsSL -o spc.tgz https://github.com/crazywhalecc/static-php-cli/releases/download/${{ env.SPC_VERSION }}/spc-macos-aarch64.tar.gz
+              ;;
+
+            *)
+              echo "unsupported operating system: ${{ matrix.operating-system }}"
+              exit 1
+              ;;
+          esac
+          tar zxvf spc.tgz
+          mv spc spc.exe
+          chmod +x spc.exe
+      - name: Download SPC (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          curl.exe -fsSL -o spc.exe https://github.com/crazywhalecc/static-php-cli/releases/download/${{ env.SPC_VERSION }}/spc-windows-x64.exe
+          chmod +x spc.exe
+
+      - name: Check SPC version
+        run: ./spc.exe --version
+
+      - name: Grab the pie.phar from artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c #v8.0.1
+        with:
+          name: pie-${{ github.sha }}.phar
+
+      - name: Build for ${{ runner.os }} ${{ runner.arch }} on ${{ matrix.operating-system }}
+        run: ./spc.exe craft resources/spc/craft.yml
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Bundle pie.phar into executable PIE binary
+        run: ./spc.exe micro:combine pie.phar --output=pie-${{ runner.os }}-${{ runner.arch }}${{ runner.os == 'Windows' && '.exe' || '' }}
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 #2.37.2
+        with:
+          coverage: none
+          tools: composer
+          php-version: "7.4"
+      - name: Quick validation that the binary runs
+        run: ./pie-${{ runner.os }}-${{ runner.arch }}${{ runner.os == 'Windows' && '.exe' || '' }} show --all
+
+      - name: Generate build provenance attestation
+        # It does not make sense to do this for PR builds, nor do contributors
+        # have permission to do. We can't write attestations to `php/pie` in an
+        # unprivileged context, otherwise anyone could send a PR with malicious
+        # code, which would store attestation that `php/pie` built the binaries,
+        # and it would look genuine. So this should NOT run for PR builds.
+        if: github.event_name != 'pull_request' && github.event.repository.visibility == 'public'
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 #v4.2.2
+        with:
+          subject-path: ${{ github.workspace }}/pie-${{ runner.os }}-${{ runner.arch }}${{ runner.os == 'Windows' && '.exe' || '' }}
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a #v7.0.1
+        with:
+          name: pie-${{ github.sha }}-${{ runner.os }}-${{ runner.arch }}.bin
+          path: pie-${{ runner.os }}-${{ runner.arch }}${{ runner.os == 'Windows' && '.exe' || '' }}

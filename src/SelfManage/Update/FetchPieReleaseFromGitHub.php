@@ -4,76 +4,155 @@ declare(strict_types=1);
 
 namespace Php\Pie\SelfManage\Update;
 
-use Composer\Util\AuthHelper;
+use Composer\Config;
+use Composer\Package\Version\VersionParser;
 use Composer\Util\HttpDownloader;
+use Php\Pie\ComposerIntegration\QuieterConsoleIO;
 use Php\Pie\File\BinaryFile;
 use RuntimeException;
+use Safe\Exceptions\FilesystemException;
 use Webmozart\Assert\Assert;
 
 use function array_filter;
+use function array_key_exists;
 use function array_map;
-use function file_put_contents;
+use function count;
 use function reset;
+use function Safe\file_put_contents;
+use function Safe\preg_match;
+use function Safe\tempnam;
+use function sprintf;
 use function sys_get_temp_dir;
-use function tempnam;
 
 /** @internal This is not public API for PIE, so should not be depended upon unless you accept the risk of BC breaks */
 final class FetchPieReleaseFromGitHub implements FetchPieRelease
 {
-    private const PIE_PHAR_NAME          = 'pie.phar';
-    private const PIE_LATEST_RELEASE_URL = '/repos/php/pie/releases/latest';
+    private const PIE_PHAR_NAME    = 'pie.phar';
+    private const PIE_REPO_URL     = '/repos/php/pie';
+    private const PIE_RELEASES_URL = '/repos/php/pie/releases';
 
     public function __construct(
         private readonly string $githubApiBaseUrl,
         private readonly HttpDownloader $httpDownloader,
-        private readonly AuthHelper $authHelper,
     ) {
     }
 
-    public function latestReleaseMetadata(): ReleaseMetadata
+    public static function factory(QuieterConsoleIO $io, Config $config, string $githubApiBaseUrl): self
     {
-        $url = $this->githubApiBaseUrl . self::PIE_LATEST_RELEASE_URL;
+        return new self($githubApiBaseUrl, new HttpDownloader($io, $config));
+    }
 
-        $decodedRepsonse = $this->httpDownloader->get(
+    public function trunkBranch(): string
+    {
+        $url = $this->githubApiBaseUrl . self::PIE_REPO_URL;
+
+        $decodedResponse = $this->httpDownloader->get(
             $url,
             [
                 'retry-auth-failure' => true,
                 'http' => [
                     'method' => 'GET',
-                    'header' => $this->authHelper->addAuthenticationHeader([], $this->githubApiBaseUrl, $url),
+                    'header' => [],
                 ],
             ],
         )->decodeJson();
 
-        Assert::isArray($decodedRepsonse);
-        Assert::keyExists($decodedRepsonse, 'tag_name');
-        Assert::stringNotEmpty($decodedRepsonse['tag_name']);
-        Assert::keyExists($decodedRepsonse, 'assets');
-        Assert::isList($decodedRepsonse['assets']);
+        Assert::isArray($decodedResponse);
+        Assert::keyExists($decodedResponse, 'default_branch');
+        Assert::stringNotEmpty($decodedResponse['default_branch']);
 
-        $assetsNamedPiePhar = array_filter(
+        $branch = $decodedResponse['default_branch'];
+
+        // Branch MUST match the N.N.x format
+        if (preg_match('/^\d+\.\d+\.x$/', $branch) !== 1) {
+            throw new RuntimeException(sprintf(
+                'The default branch "%s" returned by GitHub is not in an expected format.',
+                $branch,
+            ));
+        }
+
+        return $branch;
+    }
+
+    public function latestReleaseMetadata(Channel $updateChannel): ReleaseMetadata
+    {
+        $url = $this->githubApiBaseUrl . self::PIE_RELEASES_URL;
+
+        $decodedResponse = $this->httpDownloader->get(
+            $url,
+            [
+                'retry-auth-failure' => true,
+                'http' => [
+                    'method' => 'GET',
+                    'header' => [],
+                ],
+            ],
+        )->decodeJson();
+
+        Assert::isList($decodedResponse);
+        Assert::allIsArray($decodedResponse);
+
+        $releases = array_filter(
             array_map(
-                /** @return array{name: non-empty-string, browser_download_url: non-empty-string, ...} */
-                static function (array $asset): array {
-                    Assert::keyExists($asset, 'name');
-                    Assert::stringNotEmpty($asset['name']);
-                    Assert::keyExists($asset, 'browser_download_url');
-                    Assert::stringNotEmpty($asset['browser_download_url']);
+                static function (array $releaseResponse): ReleaseMetadata|null {
+                    Assert::keyExists($releaseResponse, 'tag_name');
+                    Assert::stringNotEmpty($releaseResponse['tag_name']);
+                    Assert::keyExists($releaseResponse, 'assets');
+                    Assert::isList($releaseResponse['assets']);
+                    Assert::allIsArray($releaseResponse['assets']);
 
-                    return $asset;
+                    $assetsNamedPiePhar = array_filter(
+                        array_map(
+                            static function (array $asset): array {
+                                Assert::keyExists($asset, 'name');
+                                Assert::stringNotEmpty($asset['name']);
+                                Assert::keyExists($asset, 'browser_download_url');
+                                Assert::stringNotEmpty($asset['browser_download_url']);
+
+                                return $asset;
+                            },
+                            $releaseResponse['assets'],
+                        ),
+                        static function (array $asset): bool {
+                            return $asset['name'] === self::PIE_PHAR_NAME;
+                        },
+                    );
+
+                    if (! count($assetsNamedPiePhar)) {
+                        return null;
+                    }
+
+                    $firstAssetNamedPiePhar = reset($assetsNamedPiePhar);
+
+                    return new ReleaseMetadata(
+                        $releaseResponse['tag_name'],
+                        $firstAssetNamedPiePhar['browser_download_url'],
+                    );
                 },
-                $decodedRepsonse['assets'],
+                array_filter(
+                    $decodedResponse,
+                    static fn (array $releaseResponse): bool => (! array_key_exists('draft', $releaseResponse) || ! $releaseResponse['draft']),
+                ),
             ),
-            static function (array $asset): bool {
-                return $asset['name'] === self::PIE_PHAR_NAME;
+            static function (ReleaseMetadata|null $releaseMetadata) use ($updateChannel): bool {
+                if ($releaseMetadata === null) {
+                    return false;
+                }
+
+                $stability = VersionParser::parseStability($releaseMetadata->tag);
+
+                return ($updateChannel === Channel::Stable && $stability === 'stable')
+                    || $updateChannel === Channel::Preview;
             },
         );
-        $firstAssetNamedPiePhar = reset($assetsNamedPiePhar);
 
-        return new ReleaseMetadata(
-            $decodedRepsonse['tag_name'],
-            $firstAssetNamedPiePhar['browser_download_url'],
-        );
+        $first = reset($releases);
+
+        if (! $first instanceof ReleaseMetadata) {
+            throw new RuntimeException('No PIE release found for channel ' . $updateChannel->value);
+        }
+
+        return $first;
     }
 
     public function downloadContent(ReleaseMetadata $releaseMetadata): BinaryFile
@@ -84,17 +163,25 @@ final class FetchPieReleaseFromGitHub implements FetchPieRelease
                 'retry-auth-failure' => true,
                 'http' => [
                     'method' => 'GET',
-                    'header' => $this->authHelper->addAuthenticationHeader([], $this->githubApiBaseUrl, $releaseMetadata->downloadUrl),
+                    'header' => [],
                 ],
             ],
         )->getBody();
         Assert::stringNotEmpty($pharContent);
 
         $tempPharFilename = tempnam(sys_get_temp_dir(), 'pie_self_update_');
-        Assert::stringNotEmpty($tempPharFilename);
 
-        if (file_put_contents($tempPharFilename, $pharContent) === false) {
-            throw new RuntimeException('Failed to write downloaded PHAR to ' . $tempPharFilename);
+        try {
+            file_put_contents($tempPharFilename, $pharContent);
+        } catch (FilesystemException $previous) {
+            throw new RuntimeException(
+                sprintf(
+                    'Failed to write downloaded PHAR to %s: %s',
+                    $tempPharFilename,
+                    $previous->getMessage(),
+                ),
+                previous: $previous,
+            );
         }
 
         return BinaryFile::fromFileWithSha256Checksum($tempPharFilename);

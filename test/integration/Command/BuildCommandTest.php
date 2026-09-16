@@ -8,11 +8,11 @@ use Composer\Util\Platform;
 use Php\Pie\Command\BuildCommand;
 use Php\Pie\Container;
 use PHPUnit\Framework\Attributes\CoversClass;
-use PHPUnit\Framework\TestCase;
-use Symfony\Component\Console\Tester\CommandTester;
+
+use function str_contains;
 
 #[CoversClass(BuildCommand::class)]
-class BuildCommandTest extends TestCase
+class BuildCommandTest extends IsolatedWorkingDirectoryTestCase
 {
     private const TEST_PACKAGE = 'asgrim/example-pie-extension';
 
@@ -20,25 +20,34 @@ class BuildCommandTest extends TestCase
 
     public function setUp(): void
     {
-        $this->commandTester = new CommandTester(Container::factory()->get(BuildCommand::class));
+        parent::setUp();
+
+        $this->commandTester = new CommandTester(Container::testFactory()->get(BuildCommand::class));
     }
 
     public function testBuildCommandWillBuildTheExtension(): void
     {
-        $this->commandTester->execute(['requested-package-and-version' => self::TEST_PACKAGE]);
+        $this->commandTester->execute(['requested-package-and-version' => [self::TEST_PACKAGE]]);
 
         $this->commandTester->assertCommandIsSuccessful();
 
         $outputString = $this->commandTester->getDisplay();
 
         if (Platform::isWindows()) {
-            self::assertStringContainsString('Nothing to do on Windows', $outputString);
+            self::assertStringContainsString('Found prebuilt archive', $outputString);
+
+            return;
+        }
+
+        if (str_contains($outputString, 'Found prebuilt archive')) {
+            self::assertStringContainsString('Found prebuilt archive', $outputString);
+            self::assertStringContainsString('Pre-packaged binary found', $outputString);
 
             return;
         }
 
         self::assertStringContainsString('phpize complete.', $outputString);
-        self::assertStringContainsString('Configure complete.', $outputString);
+        self::assertStringContainsString('Configure complete', $outputString);
         self::assertStringContainsString('Build complete:', $outputString);
     }
 }

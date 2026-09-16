@@ -5,11 +5,11 @@ declare(strict_types=1);
 namespace Php\PieUnitTest\Downloading;
 
 use Composer\Downloader\TransportException;
-use Composer\Package\CompletePackage;
-use Composer\Util\AuthHelper;
+use Composer\Package\CompletePackageInterface;
 use Composer\Util\Http\Response;
 use Composer\Util\HttpDownloader;
 use Php\Pie\DependencyResolver\Package;
+use Php\Pie\Downloading\DownloadUrlMethod;
 use Php\Pie\Downloading\Exception\CouldNotFindReleaseAsset;
 use Php\Pie\Downloading\GithubPackageReleaseAssets;
 use Php\Pie\ExtensionName;
@@ -45,9 +45,8 @@ final class GithubPackageReleaseAssetsTest extends TestCase
             ThreadSafetyMode::ThreadSafe,
             1,
             WindowsCompiler::VC14,
+            null,
         );
-
-        $authHelper = $this->createMock(AuthHelper::class);
 
         $httpDownloaderResponse = $this->createMock(Response::class);
         $httpDownloaderResponse
@@ -57,11 +56,11 @@ final class GithubPackageReleaseAssetsTest extends TestCase
                 'assets' => [
                     [
                         'name' => 'php_foo-1.2.3-8.3-vc14-nts-x86.zip',
-                        'browser_download_url' => 'wrong_download_url',
+                        'url' => 'wrong_download_url',
                     ],
                     [
                         'name' => 'php_foo-1.2.3-8.3-vc14-ts-x86.zip',
-                        'browser_download_url' => 'actual_download_url',
+                        'url' => 'actual_download_url',
                     ],
                 ],
             ]);
@@ -73,7 +72,7 @@ final class GithubPackageReleaseAssetsTest extends TestCase
             ->willReturn($httpDownloaderResponse);
 
         $package = new Package(
-            $this->createMock(CompletePackage::class),
+            $this->createMock(CompletePackageInterface::class),
             ExtensionType::PhpModule,
             ExtensionName::normaliseFromString('foo'),
             'asgrim/example-pie-extension',
@@ -85,16 +84,16 @@ final class GithubPackageReleaseAssetsTest extends TestCase
 
         self::assertSame(
             'actual_download_url',
-            $releaseAssets->findMatchingReleaseAssetUrl(
+            $releaseAssets->findMatchingReleaseAsset(
                 $targetPlatform,
                 $package,
-                $authHelper,
                 $httpDownloader,
+                DownloadUrlMethod::WindowsBinaryDownload,
                 WindowsExtensionAssetName::zipNames(
                     $targetPlatform,
                     $package,
                 ),
-            ),
+            )->url,
         );
     }
 
@@ -113,9 +112,8 @@ final class GithubPackageReleaseAssetsTest extends TestCase
             ThreadSafetyMode::ThreadSafe,
             1,
             WindowsCompiler::VC14,
+            null,
         );
-
-        $authHelper = $this->createMock(AuthHelper::class);
 
         $httpDownloaderResponse = $this->createMock(Response::class);
         $httpDownloaderResponse
@@ -125,11 +123,11 @@ final class GithubPackageReleaseAssetsTest extends TestCase
                 'assets' => [
                     [
                         'name' => 'php_foo-1.2.3-8.3-nts-vc14-x86.zip',
-                        'browser_download_url' => 'wrong_download_url',
+                        'url' => 'wrong_download_url',
                     ],
                     [
                         'name' => 'php_foo-1.2.3-8.3-ts-vc14-x86.zip',
-                        'browser_download_url' => 'actual_download_url',
+                        'url' => 'actual_download_url',
                     ],
                 ],
             ]);
@@ -141,7 +139,7 @@ final class GithubPackageReleaseAssetsTest extends TestCase
             ->willReturn($httpDownloaderResponse);
 
         $package = new Package(
-            $this->createMock(CompletePackage::class),
+            $this->createMock(CompletePackageInterface::class),
             ExtensionType::PhpModule,
             ExtensionName::normaliseFromString('foo'),
             'asgrim/example-pie-extension',
@@ -153,16 +151,16 @@ final class GithubPackageReleaseAssetsTest extends TestCase
 
         self::assertSame(
             'actual_download_url',
-            $releaseAssets->findMatchingReleaseAssetUrl(
+            $releaseAssets->findMatchingReleaseAsset(
                 $targetPlatform,
                 $package,
-                $authHelper,
                 $httpDownloader,
+                DownloadUrlMethod::WindowsBinaryDownload,
                 WindowsExtensionAssetName::zipNames(
                     $targetPlatform,
                     $package,
                 ),
-            ),
+            )->url,
         );
     }
 
@@ -176,9 +174,8 @@ final class GithubPackageReleaseAssetsTest extends TestCase
             ThreadSafetyMode::ThreadSafe,
             1,
             WindowsCompiler::VC14,
+            null,
         );
-
-        $authHelper = $this->createMock(AuthHelper::class);
 
         $e = new TransportException('not found', 404);
         $e->setStatusCode(404);
@@ -190,7 +187,7 @@ final class GithubPackageReleaseAssetsTest extends TestCase
             ->willThrowException($e);
 
         $package = new Package(
-            $this->createMock(CompletePackage::class),
+            $this->createMock(CompletePackageInterface::class),
             ExtensionType::PhpModule,
             ExtensionName::normaliseFromString('foo'),
             'asgrim/example-pie-extension',
@@ -201,11 +198,11 @@ final class GithubPackageReleaseAssetsTest extends TestCase
         $releaseAssets = new GithubPackageReleaseAssets('https://test-github-api-base-url.thephp.foundation');
 
         $this->expectException(CouldNotFindReleaseAsset::class);
-        $releaseAssets->findMatchingReleaseAssetUrl(
+        $releaseAssets->findMatchingReleaseAsset(
             $targetPlatform,
             $package,
-            $authHelper,
             $httpDownloader,
+            DownloadUrlMethod::WindowsBinaryDownload,
             WindowsExtensionAssetName::zipNames(
                 $targetPlatform,
                 $package,

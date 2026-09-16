@@ -4,18 +4,18 @@ declare(strict_types=1);
 
 namespace Php\Pie\Installing\Ini;
 
+use Composer\IO\IOInterface;
 use Php\Pie\DependencyResolver\Package;
 use Php\Pie\ExtensionType;
 use Php\Pie\File\Sudo;
 use Php\Pie\File\SudoFilePut;
 use Php\Pie\Platform\TargetPhp\PhpBinaryPath;
-use Symfony\Component\Console\Output\OutputInterface;
+use Safe\Exceptions\FilesystemException;
 use Throwable;
 
-use function file_get_contents;
 use function is_readable;
-use function is_string;
 use function is_writable;
+use function Safe\file_get_contents;
 use function sprintf;
 
 use const PHP_EOL;
@@ -28,42 +28,43 @@ class AddExtensionToTheIniFile
         string $ini,
         Package $package,
         PhpBinaryPath $phpBinaryPath,
-        OutputInterface $output,
+        IOInterface $io,
         callable|null $additionalEnableStep,
     ): bool {
         if (! is_writable($ini) && ! Sudo::exists()) {
-            $output->writeln(
+            $io->write(
                 sprintf(
                     'PHP is configured to use %s, but it is not writable by PIE.',
                     $ini,
                 ),
-                OutputInterface::VERBOSITY_VERBOSE,
+                verbosity: IOInterface::VERBOSE,
             );
 
             return false;
         }
 
         if (! is_readable($ini)) {
-            $output->writeln(
+            $io->write(
                 sprintf(
                     'Could not read %s to make a backup of it, aborting enablement of extension',
                     $ini,
                 ),
-                OutputInterface::VERBOSITY_VERBOSE,
+                verbosity: IOInterface::VERBOSE,
             );
 
             return false;
         }
 
-        $originalIniContent = file_get_contents($ini);
-
-        if (! is_string($originalIniContent)) {
-            $output->writeln(
+        try {
+            $originalIniContent = file_get_contents($ini);
+        } catch (FilesystemException $e) {
+            $io->write(
                 sprintf(
-                    'Tried making a backup of %s but could not read it, aborting enablement of extension',
+                    'Tried making a backup of %s but could not read it, aborting enablement of extension: %s',
                     $ini,
+                    $e->getMessage(),
                 ),
-                OutputInterface::VERBOSITY_VERBOSE,
+                verbosity: IOInterface::VERBOSE,
             );
 
             return false;
@@ -74,26 +75,26 @@ class AddExtensionToTheIniFile
                 $ini,
                 $originalIniContent . $this->iniFileContent($package),
             );
-            $output->writeln(
+            $io->write(
                 sprintf(
                     'Enabled extension %s in the INI file %s',
                     $package->extensionName()->name(),
                     $ini,
                 ),
-                OutputInterface::VERBOSITY_VERBOSE,
+                verbosity: IOInterface::VERBOSE,
             );
 
             if ($additionalEnableStep !== null && ! $additionalEnableStep()) {
                 return false;
             }
 
-            $phpBinaryPath->assertExtensionIsLoadedInRuntime($package->extensionName(), $output);
+            $phpBinaryPath->assertExtensionIsLoadedInRuntime($package->extensionName(), $io);
 
             return true;
         } catch (Throwable $anything) {
             SudoFilePut::contents($ini, $originalIniContent);
 
-            $output->writeln(sprintf(
+            $io->writeError(sprintf(
                 '<error>Something went wrong enabling the %s extension: %s</error>',
                 $package->extensionName()->name(),
                 $anything->getMessage(),

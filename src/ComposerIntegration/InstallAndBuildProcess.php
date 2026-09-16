@@ -7,6 +7,7 @@ namespace Php\Pie\ComposerIntegration;
 use Composer\Package\CompletePackageInterface;
 use Composer\PartialComposer;
 use Php\Pie\Building\Build;
+use Php\Pie\Building\PlaceholderReplacer;
 use Php\Pie\DependencyResolver\Package;
 use Php\Pie\Downloading\DownloadedPackage;
 use Php\Pie\Installing\Install;
@@ -16,11 +17,11 @@ use function sprintf;
 /** @internal This is not public API for PIE, so should not be depended upon unless you accept the risk of BC breaks */
 class InstallAndBuildProcess
 {
-    /** @psalm-suppress PossiblyUnusedMethod no direct reference; used in service locator */
     public function __construct(
         private readonly Build $pieBuild,
         private readonly Install $pieInstall,
-        private readonly InstalledJsonMetadata $installedJsonMetadata,
+        private readonly AddInstalledJsonMetadata $addInstalledJsonMetadata,
+        private readonly PlaceholderReplacer $placeholderReplacer,
     ) {
     }
 
@@ -30,35 +31,41 @@ class InstallAndBuildProcess
         CompletePackageInterface $composerPackage,
         string $installPath,
     ): void {
-        $output = $composerRequest->pieOutput;
+        $io = $composerRequest->pieOutput;
 
         $downloadedPackage = DownloadedPackage::fromPackageAndExtractedPath(
             Package::fromComposerCompletePackage($composerPackage),
             $installPath,
         );
 
-        $output->writeln(sprintf(
+        $io->write(sprintf(
             '<info>Extracted %s source to:</info> %s',
             $downloadedPackage->package->prettyNameAndVersion(),
             $downloadedPackage->extractedSourcePath,
         ));
 
-        $this->installedJsonMetadata->addDownloadMetadata(
+        $this->placeholderReplacer->replacePlaceholdersWithPlaceholderReplacements(
+            $io,
+            $composerRequest->targetPlatform,
+            $downloadedPackage,
+        );
+
+        $this->addInstalledJsonMetadata->addDownloadMetadata(
             $composer,
             $composerRequest,
             $composerPackage,
         );
 
+        $builtBinaryFile = null;
         if ($composerRequest->operation->shouldBuild()) {
             $builtBinaryFile = ($this->pieBuild)(
                 $downloadedPackage,
                 $composerRequest->targetPlatform,
-                $composerRequest->configureOptions,
-                $output,
-                $composerRequest->phpizePath,
+                $composerRequest->configureOptionsFor($downloadedPackage->package->name()),
+                $io,
             );
 
-            $this->installedJsonMetadata->addBuildMetadata(
+            $this->addInstalledJsonMetadata->addBuildMetadata(
                 $composer,
                 $composerRequest,
                 $composerPackage,
@@ -70,13 +77,14 @@ class InstallAndBuildProcess
             return;
         }
 
-        $this->installedJsonMetadata->addInstallMetadata(
+        $this->addInstalledJsonMetadata->addInstallMetadata(
             $composer,
             $composerPackage,
             ($this->pieInstall)(
                 $downloadedPackage,
                 $composerRequest->targetPlatform,
-                $output,
+                $builtBinaryFile,
+                $io,
                 $composerRequest->attemptToSetupIniFile,
             ),
         );

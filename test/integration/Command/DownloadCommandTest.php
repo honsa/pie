@@ -7,13 +7,11 @@ namespace Php\PieIntegrationTest\Command;
 use Composer\Util\Platform;
 use Php\Pie\Command\DownloadCommand;
 use Php\Pie\Container;
-use Php\Pie\DependencyResolver\UnableToResolveRequirement;
+use Php\PieIntegrationTest\ExamplePieExtensionFixture;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\RequiresOperatingSystemFamily;
 use PHPUnit\Framework\Attributes\RequiresPhp;
-use PHPUnit\Framework\TestCase;
-use Symfony\Component\Console\Tester\CommandTester;
 
 use function array_combine;
 use function array_map;
@@ -23,15 +21,18 @@ use function is_executable;
 use const PHP_VERSION_ID;
 
 #[CoversClass(DownloadCommand::class)]
-class DownloadCommandTest extends TestCase
+class DownloadCommandTest extends IsolatedWorkingDirectoryTestCase
 {
-    private const TEST_PACKAGE = 'asgrim/example-pie-extension';
+    private const TEST_PACKAGE_LATEST = ExamplePieExtensionFixture::LATEST_VERSION;
+    private const TEST_PACKAGE        = 'asgrim/example-pie-extension';
 
     private CommandTester $commandTester;
 
     public function setUp(): void
     {
-        $this->commandTester = new CommandTester(Container::factory()->get(DownloadCommand::class));
+        parent::setUp();
+
+        $this->commandTester = new CommandTester(Container::testFactory()->get(DownloadCommand::class));
     }
 
     /**
@@ -45,9 +46,9 @@ class DownloadCommandTest extends TestCase
     public static function validVersionsList(): array
     {
         $versionsAndExpected = [
-            [self::TEST_PACKAGE, self::TEST_PACKAGE . ':2.0.2'],
-            [self::TEST_PACKAGE . ':*', self::TEST_PACKAGE . ':2.0.2'],
-            [self::TEST_PACKAGE . ':^2.0', self::TEST_PACKAGE . ':2.0.2'],
+            [self::TEST_PACKAGE, self::TEST_PACKAGE . ':' . self::TEST_PACKAGE_LATEST],
+            [self::TEST_PACKAGE . ':*', self::TEST_PACKAGE . ':' . self::TEST_PACKAGE_LATEST],
+            [self::TEST_PACKAGE . ':^2.0', self::TEST_PACKAGE . ':' . self::TEST_PACKAGE_LATEST],
         ];
 
         if (PHP_VERSION_ID >= 80300 && PHP_VERSION_ID < 80400) {
@@ -68,7 +69,7 @@ class DownloadCommandTest extends TestCase
         string $requestedVersion,
         string $expectedVersion,
     ): void {
-        $this->commandTester->execute(['requested-package-and-version' => $requestedVersion]);
+        $this->commandTester->execute(['requested-package-and-version' => [$requestedVersion]]);
 
         $this->commandTester->assertCommandIsSuccessful();
 
@@ -83,7 +84,7 @@ class DownloadCommandTest extends TestCase
             self::markTestSkipped('This test can only run on non-Windows systems');
         }
 
-        $this->commandTester->execute(['requested-package-and-version' => 'asgrim/example-pie-extension:dev-main#9b5e6c80a1e05556e4e6824f0c112a4992cee001']);
+        $this->commandTester->execute(['requested-package-and-version' => ['asgrim/example-pie-extension:dev-main#9b5e6c80a1e05556e4e6824f0c112a4992cee001']]);
 
         $this->commandTester->assertCommandIsSuccessful();
 
@@ -110,7 +111,7 @@ class DownloadCommandTest extends TestCase
 
         $this->commandTester->execute([
             '--with-php-config' => $phpConfigPath,
-            'requested-package-and-version' => $requestedVersion,
+            'requested-package-and-version' => [$requestedVersion],
         ]);
 
         $this->commandTester->assertCommandIsSuccessful();
@@ -132,7 +133,7 @@ class DownloadCommandTest extends TestCase
 
         $this->commandTester->execute([
             '--with-php-path' => $phpBinaryPath,
-            'requested-package-and-version' => $requestedVersion,
+            'requested-package-and-version' => [$requestedVersion],
         ]);
 
         $this->commandTester->assertCommandIsSuccessful();
@@ -145,9 +146,14 @@ class DownloadCommandTest extends TestCase
     #[RequiresPhp('<8.2')]
     public function testDownloadCommandFailsWhenUsingIncompatiblePhpVersion(): void
     {
-        $this->expectException(UnableToResolveRequirement::class);
         // 1.0.0 is only compatible with PHP 8.3.0
-        $this->commandTester->execute(['requested-package-and-version' => self::TEST_PACKAGE . ':1.0.0']);
+        self::assertSame(1, $this->commandTester->execute(['requested-package-and-version' => [self::TEST_PACKAGE . ':1.0.0']]));
+
+        $output = $this->commandTester->getDisplay();
+        self::assertStringContainsString(
+            'Unable to find an installable package asgrim/example-pie-extension for version 1.0.0, with minimum stability stable.',
+            $output,
+        );
     }
 
     #[RequiresOperatingSystemFamily('Linux')]
@@ -159,7 +165,7 @@ class DownloadCommandTest extends TestCase
 
         $this->commandTester->execute(
             [
-                'requested-package-and-version' => $incompatiblePackage,
+                'requested-package-and-version' => [$incompatiblePackage],
                 '--force' => true,
             ],
         );

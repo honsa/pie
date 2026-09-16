@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Php\PieUnitTest\Installing\Ini;
 
+use Composer\IO\BufferIO;
 use Composer\Package\CompletePackageInterface;
 use Php\Pie\DependencyResolver\Package;
 use Php\Pie\Downloading\DownloadedPackage;
@@ -21,14 +22,14 @@ use Php\Pie\Platform\ThreadSafetyMode;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\MockObject\MockObject;
 use PHPUnit\Framework\TestCase;
-use Symfony\Component\Console\Output\BufferedOutput;
+use Symfony\Component\Console\Output\OutputInterface;
 
 #[CoversClass(StandardSinglePhpIni::class)]
 final class StandardSinglePhpIniTest extends TestCase
 {
     private const INI_FILE = __DIR__ . '/../../../assets/example_ini_files/with_commented_extension.ini';
 
-    private BufferedOutput $output;
+    private BufferIO $io;
     private PhpBinaryPath&MockObject $mockPhpBinary;
     private CheckAndAddExtensionToIniIfNeeded&MockObject $checkAndAddExtensionToIniIfNeeded;
     private TargetPlatform $targetPlatform;
@@ -40,13 +41,9 @@ final class StandardSinglePhpIniTest extends TestCase
     {
         parent::setUp();
 
-        $this->output = new BufferedOutput(BufferedOutput::VERBOSITY_VERBOSE);
+        $this->io = new BufferIO(verbosity: OutputInterface::VERBOSITY_VERBOSE);
 
         $this->mockPhpBinary = $this->createMock(PhpBinaryPath::class);
-        /**
-         * @psalm-suppress PossiblyNullFunctionCall
-         * @psalm-suppress UndefinedThisPropertyAssignment
-         */
         (fn () => $this->phpBinaryPath = '/path/to/php')
             ->bindTo($this->mockPhpBinary, PhpBinaryPath::class)();
 
@@ -59,6 +56,7 @@ final class StandardSinglePhpIniTest extends TestCase
             Architecture::x86_64,
             ThreadSafetyMode::ThreadSafe,
             1,
+            null,
             null,
         );
 
@@ -116,7 +114,7 @@ final class StandardSinglePhpIniTest extends TestCase
             $this->targetPlatform,
             $this->downloadedPackage,
             $this->binaryFile,
-            $this->output,
+            $this->io,
         ));
     }
 
@@ -134,7 +132,7 @@ final class StandardSinglePhpIniTest extends TestCase
                 self::INI_FILE,
                 $this->targetPlatform,
                 $this->downloadedPackage,
-                $this->output,
+                $this->io,
             )
             ->willReturn(true);
 
@@ -142,7 +140,7 @@ final class StandardSinglePhpIniTest extends TestCase
             $this->targetPlatform,
             $this->downloadedPackage,
             $this->binaryFile,
-            $this->output,
+            $this->io,
         ));
     }
 
@@ -160,7 +158,7 @@ final class StandardSinglePhpIniTest extends TestCase
                 self::INI_FILE,
                 $this->targetPlatform,
                 $this->downloadedPackage,
-                $this->output,
+                $this->io,
             )
             ->willReturn(false);
 
@@ -168,7 +166,7 @@ final class StandardSinglePhpIniTest extends TestCase
             $this->targetPlatform,
             $this->downloadedPackage,
             $this->binaryFile,
-            $this->output,
+            $this->io,
         ));
     }
 }

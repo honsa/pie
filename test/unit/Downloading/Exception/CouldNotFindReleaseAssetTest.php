@@ -4,8 +4,9 @@ declare(strict_types=1);
 
 namespace Php\PieUnitTest\Downloading\Exception;
 
-use Composer\Package\CompletePackage;
+use Composer\Package\CompletePackageInterface;
 use Php\Pie\DependencyResolver\Package;
+use Php\Pie\Downloading\DownloadUrlMethod;
 use Php\Pie\Downloading\Exception\CouldNotFindReleaseAsset;
 use Php\Pie\ExtensionName;
 use Php\Pie\ExtensionType;
@@ -15,16 +16,17 @@ use Php\Pie\Platform\OperatingSystemFamily;
 use Php\Pie\Platform\TargetPhp\PhpBinaryPath;
 use Php\Pie\Platform\TargetPlatform;
 use Php\Pie\Platform\ThreadSafetyMode;
+use Php\Pie\Platform\WindowsCompiler;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\TestCase;
 
 #[CoversClass(CouldNotFindReleaseAsset::class)]
 final class CouldNotFindReleaseAssetTest extends TestCase
 {
-    public function testForPackage(): void
+    public function testForPackageWithRegularPackage(): void
     {
         $package = new Package(
-            $this->createMock(CompletePackage::class),
+            $this->createMock(CompletePackageInterface::class),
             ExtensionType::PhpModule,
             ExtensionName::normaliseFromString('foo'),
             'foo/bar',
@@ -32,15 +34,59 @@ final class CouldNotFindReleaseAssetTest extends TestCase
             null,
         );
 
-        $exception = CouldNotFindReleaseAsset::forPackage($package, ['something.zip', 'something2.zip']);
+        $exception = CouldNotFindReleaseAsset::forPackage(
+            new TargetPlatform(
+                OperatingSystem::NonWindows,
+                OperatingSystemFamily::Linux,
+                PhpBinaryPath::fromCurrentProcess(),
+                Architecture::x86_64,
+                ThreadSafetyMode::NonThreadSafe,
+                1,
+                null,
+                null,
+            ),
+            $package,
+            DownloadUrlMethod::PrePackagedSourceDownload,
+            ['something.zip', 'something2.zip'],
+        );
 
         self::assertSame('Could not find release asset for foo/bar:1.2.3 named one of "something.zip, something2.zip"', $exception->getMessage());
+    }
+
+    public function testForPackageWithWindowsPackage(): void
+    {
+        $package = new Package(
+            $this->createMock(CompletePackageInterface::class),
+            ExtensionType::PhpModule,
+            ExtensionName::normaliseFromString('foo'),
+            'foo/bar',
+            '1.2.3',
+            null,
+        );
+
+        $exception = CouldNotFindReleaseAsset::forPackage(
+            new TargetPlatform(
+                OperatingSystem::Windows,
+                OperatingSystemFamily::Windows,
+                PhpBinaryPath::fromCurrentProcess(),
+                Architecture::x86_64,
+                ThreadSafetyMode::NonThreadSafe,
+                1,
+                WindowsCompiler::VS17,
+                null,
+            ),
+            $package,
+            DownloadUrlMethod::WindowsBinaryDownload,
+            ['something.zip', 'something2.zip'],
+        );
+
+        self::assertSame('Windows archive with prebuilt extension for foo/bar was not attached on release 1.2.3 - looked for one of "something.zip, something2.zip"', $exception->getMessage());
     }
 
     public function testForPackageWithMissingTag(): void
     {
         $package = new Package(
-            $this->createMock(CompletePackage::class),
+            $this->createMock(CompletePackageInterface::class),
             ExtensionType::PhpModule,
             ExtensionName::normaliseFromString('foo'),
             'foo/bar',
@@ -48,7 +94,7 @@ final class CouldNotFindReleaseAssetTest extends TestCase
             null,
         );
 
-        $exception = CouldNotFindReleaseAsset::forPackageWithMissingTag($package);
+        $exception = CouldNotFindReleaseAsset::forPackageWithMissingTag($package, DownloadUrlMethod::PrePackagedSourceDownload);
 
         self::assertSame('Could not find release by tag name for foo/bar:1.2.3', $exception->getMessage());
     }
@@ -63,6 +109,7 @@ final class CouldNotFindReleaseAssetTest extends TestCase
             Architecture::x86,
             ThreadSafetyMode::NonThreadSafe,
             1,
+            null,
             null,
         ));
 

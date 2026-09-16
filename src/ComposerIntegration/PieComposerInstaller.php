@@ -13,33 +13,31 @@ use Php\Pie\Platform\InstalledPiePackages;
 use Php\Pie\Platform\TargetPhp\PhpBinaryPath;
 use Webmozart\Assert\Assert;
 
-/**
- * @internal This is not public API for PIE, so should not be depended upon unless you accept the risk of BC breaks
- *
- * @psalm-suppress PropertyNotSetInConstructor Property $fixedRootPackage is defined in parent
- */
+/** @internal This is not public API for PIE, so should not be depended upon unless you accept the risk of BC breaks */
 class PieComposerInstaller extends Installer
 {
-    private PhpBinaryPath|null $phpBinaryPath           = null;
-    private ExtensionName|null $extensionBeingInstalled = null;
-    private Composer|null $composer                     = null;
+    private PhpBinaryPath|null $phpBinaryPath = null;
+    /** @var list<ExtensionName> */
+    private array $extensionsBeingInstalled = [];
+    private Composer|null $composer         = null;
 
     protected function createPlatformRepo(bool $forUpdate): PlatformRepository
     {
         Assert::notNull($this->phpBinaryPath, '$phpBinaryPath was not set, maybe createWithPhpBinary was not used?');
-        Assert::notNull($this->extensionBeingInstalled, '$extensionBeingInstalled was not set, maybe createWithPhpBinary was not used?');
+        Assert::isNonEmptyList($this->extensionsBeingInstalled, '$extensionsBeingInstalled was not set, maybe createWithPhpBinary was not used?');
+        Assert::allIsInstanceOf($this->extensionsBeingInstalled, ExtensionName::class, '$extensionsBeingInstalled were not all ExtensionName instances');
         Assert::notNull($this->composer, '$composer was not set, maybe createWithPhpBinary was not used?');
 
-        return new PhpBinaryPathBasedPlatformRepository($this->phpBinaryPath, $this->composer, new InstalledPiePackages(), $this->extensionBeingInstalled);
+        return new PhpBinaryPathBasedPlatformRepository($this->phpBinaryPath, $this->composer, new InstalledPiePackages(), $this->extensionsBeingInstalled);
     }
 
+    /** @param list<ExtensionName> $extensionsBeingInstalled */
     public static function createWithPhpBinary(
         PhpBinaryPath $php,
-        ExtensionName $extensionBeingInstalled,
+        array $extensionsBeingInstalled,
         IOInterface $io,
         Composer $composer,
     ): self {
-        /** @psalm-suppress InvalidArgument some kind of unrelated type mismatch, defined in parent */
         $composerInstaller = new self(
             $io,
             $composer->getConfig(),
@@ -52,9 +50,9 @@ class PieComposerInstaller extends Installer
             $composer->getAutoloadGenerator(),
         );
 
-        $composerInstaller->phpBinaryPath           = $php;
-        $composerInstaller->extensionBeingInstalled = $extensionBeingInstalled;
-        $composerInstaller->composer                = $composer;
+        $composerInstaller->phpBinaryPath            = $php;
+        $composerInstaller->extensionsBeingInstalled = $extensionsBeingInstalled;
+        $composerInstaller->composer                 = $composer;
 
         return $composerInstaller;
     }

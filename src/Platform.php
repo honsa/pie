@@ -8,23 +8,41 @@ use Composer\Util\Platform as ComposerPlatform;
 use Composer\Util\Silencer;
 use Php\Pie\Platform\TargetPlatform;
 use RuntimeException;
+use Safe\Exceptions\FilesystemException;
 
 use function array_keys;
+use function defined;
 use function implode;
 use function md5;
 use function rtrim;
+use function Safe\fopen;
+use function str_contains;
 use function strpos;
 use function strtr;
 
 use const DIRECTORY_SEPARATOR;
+use const PHP_BUILD_PROVIDER;
+use const STDIN;
 
 /** @internal This is not public API for PIE, so should not be depended upon unless you accept the risk of BC breaks */
 class Platform
 {
+    public static function isInteractive(): bool
+    {
+        try {
+            $stdin = defined('STDIN') ? STDIN : fopen('php://stdin', 'r');
+        } catch (FilesystemException) {
+            $stdin = false;
+        }
+
+        return ComposerPlatform::getEnv('COMPOSER_NO_INTERACTION') !== '1'
+            && $stdin !== false
+            && ComposerPlatform::isTty($stdin);
+    }
+
     private static function useXdg(): bool
     {
         foreach (array_keys($_SERVER) as $key) {
-            /** @psalm-suppress RedundantCastGivenDocblockType */
             if (strpos((string) $key, 'XDG_') === 0) {
                 return true;
             }
@@ -42,6 +60,48 @@ class Platform
         }
 
         return rtrim(strtr($home, '\\', '/'), '/');
+    }
+
+    public static function getPieBaseWorkingDirectory(): string
+    {
+        $home = ComposerPlatform::getEnv('PIE_WORKING_DIRECTORY');
+        if ($home !== false && $home !== '') {
+            return $home;
+        }
+
+        if (ComposerPlatform::isWindows()) {
+            $appData = ComposerPlatform::getEnv('APPDATA');
+            if ($appData === false || $appData === '') {
+                throw new RuntimeException('The APPDATA or PIE_WORKING_DIRECTORY environment variable must be set for PIE to run correctly');
+            }
+
+            return rtrim(strtr($appData, '\\', '/'), '/') . '/PIE';
+        }
+
+        $userDir = self::getUserDir();
+        $dirs    = [];
+
+        if (self::useXdg()) {
+            // XDG Base Directory Specifications
+            $xdgConfig = ComposerPlatform::getEnv('XDG_CONFIG_HOME');
+            if ($xdgConfig === false || $xdgConfig === '') {
+                $xdgConfig = $userDir . '/.config';
+            }
+
+            $dirs[] = $xdgConfig . '/pie';
+        }
+
+        $dirs[] = $userDir . '/.pie';
+
+        // select first dir which exists of: $XDG_CONFIG_HOME/pie or ~/.pie
+        foreach ($dirs as $dir) {
+            if (Silencer::call('is_dir', $dir)) {
+                return $dir;
+            }
+        }
+
+        // if none exists, we default to first defined one (XDG one if system uses it, or ~/.pie otherwise)
+        return $dirs[0];
     }
 
     /**
@@ -64,49 +124,17 @@ class Platform
             ],
         ));
 
-        $home = ComposerPlatform::getEnv('PIE_WORKING_DIRECTORY');
-        if ($home !== false && $home !== '') {
-            return $home . $targetPlatformPath;
-        }
-
-        if (ComposerPlatform::isWindows()) {
-            $appData = ComposerPlatform::getEnv('APPDATA');
-            if ($appData === false || $appData === '') {
-                throw new RuntimeException('The APPDATA or PIE_WORKING_DIRECTORY environment variable must be set for PIE to run correctly');
-            }
-
-            return rtrim(strtr($appData, '\\', '/'), '/') . '/PIE' . $targetPlatformPath . '/';
-        }
-
-        $userDir = self::getUserDir();
-        $dirs    = [];
-
-        if (self::useXdg()) {
-            // XDG Base Directory Specifications
-            $xdgConfig = ComposerPlatform::getEnv('XDG_CONFIG_HOME');
-            if ($xdgConfig === false || $xdgConfig === '') {
-                $xdgConfig = $userDir . '/.config';
-            }
-
-            $dirs[] = $xdgConfig . '/pie';
-        }
-
-        $dirs[] = $userDir . '/.pie';
-
-        // select first dir which exists of: $XDG_CONFIG_HOME/pie or ~/.pie
-        foreach ($dirs as $dir) {
-            if (Silencer::call('is_dir', $dir)) {
-                return $dir . $targetPlatformPath;
-            }
-        }
-
-        // if none exists, we default to first defined one (XDG one if system uses it, or ~/.pie otherwise)
-        return $dirs[0] . $targetPlatformPath;
+        return self::getPieBaseWorkingDirectory() . $targetPlatformPath;
     }
 
     /** @return non-empty-string */
     public static function getPieJsonFilename(TargetPlatform $targetPlatform): string
     {
         return self::getPieWorkingDirectory($targetPlatform) . '/pie.json';
+    }
+
+    public static function isRunningStaticPhp(): bool
+    {
+        return defined('PHP_BUILD_PROVIDER') && str_contains(PHP_BUILD_PROVIDER, 'static-php-cli');
     }
 }

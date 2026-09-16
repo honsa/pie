@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Php\Pie\Command;
 
 use Symfony\Component\Console\Command\Command;
+use Symfony\Component\Console\Formatter\OutputFormatter;
 use Symfony\Component\Console\Input\ArrayInput;
 use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\Console\Output\OutputInterface;
@@ -20,12 +21,16 @@ use function array_values;
 /** @internal This is not public API for PIE, so should not be depended upon unless you accept the risk of BC breaks */
 class InvokeSubCommand
 {
+    public function __construct(private readonly OutputInterface $output)
+    {
+    }
+
     /** @param array<array-key, mixed> $subCommandInput */
     public function __invoke(
         Command $command,
         array $subCommandInput,
         InputInterface $originalCommandInput,
-        OutputInterface $output,
+        OutputFormatter|null $formatter = null,
     ): int {
         $originalSuppliedOptions = array_filter($originalCommandInput->getOptions());
         $installForProjectInput  = new ArrayInput(array_merge(
@@ -39,6 +44,19 @@ class InvokeSubCommand
         $application = $command->getApplication();
         Assert::notNull($application);
 
-        return $application->doRun($installForProjectInput, $output);
+        if ($formatter instanceof OutputFormatter) {
+            $oldFormatter = $this->output->getFormatter();
+            $this->output->setFormatter($formatter);
+        }
+
+        try {
+            $result = $application->doRun($installForProjectInput, $this->output);
+        } finally {
+            if ($formatter instanceof OutputFormatter) {
+                $this->output->setFormatter($oldFormatter);
+            }
+        }
+
+        return $result;
     }
 }

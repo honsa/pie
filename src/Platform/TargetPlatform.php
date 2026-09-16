@@ -6,12 +6,12 @@ namespace Php\Pie\Platform;
 
 use Fidry\CpuCoreCounter\CpuCoreCounter;
 use Php\Pie\Platform\TargetPhp\PhpBinaryPath;
+use Php\Pie\Platform\TargetPhp\PhpizePath;
 
-use function array_key_exists;
 use function explode;
 use function function_exists;
 use function posix_getuid;
-use function preg_match;
+use function Safe\preg_match;
 use function trim;
 
 /**
@@ -21,6 +21,8 @@ use function trim;
  */
 class TargetPlatform
 {
+    private static LibcFlavour $libcFlavour;
+
     public function __construct(
         public readonly OperatingSystem $operatingSystem,
         public readonly OperatingSystemFamily $operatingSystemFamily,
@@ -29,7 +31,17 @@ class TargetPlatform
         public readonly ThreadSafetyMode $threadSafety,
         public readonly int $makeParallelJobs,
         public readonly WindowsCompiler|null $windowsCompiler,
+        public readonly PhpizePath|null $phpizePath,
     ) {
+    }
+
+    public function libcFlavour(): LibcFlavour
+    {
+        if (! isset(self::$libcFlavour)) {
+            self::$libcFlavour = LibcFlavour::detect();
+        }
+
+        return self::$libcFlavour;
     }
 
     public static function isRunningAsRoot(): bool
@@ -37,33 +49,12 @@ class TargetPlatform
         return function_exists('posix_getuid') && posix_getuid() === 0;
     }
 
-    public static function fromPhpBinaryPath(PhpBinaryPath $phpBinaryPath, int|null $makeParallelJobs): self
+    public static function fromPhpBinaryPath(PhpBinaryPath $phpBinaryPath, int|null $makeParallelJobs, PhpizePath|null $phpizePath): self
     {
-        $os       = $phpBinaryPath->operatingSystem();
-        $osFamily = $phpBinaryPath->operatingSystemFamily();
-
-        $phpinfo = $phpBinaryPath->phpinfo();
-
-        $architecture = $phpBinaryPath->machineType();
-
-        // If we're not on ARM, a more reliable way of determining 32-bit/64-bit is to use PHP_INT_SIZE
-        if ($architecture !== Architecture::arm64) {
-            $architecture = $phpBinaryPath->phpIntSize() === 4 ? Architecture::x86 : Architecture::x86_64;
-        }
-
-        /**
-         * Based on xdebug.org wizard, copyright Derick Rethans, used under MIT licence
-         *
-         * @link https://github.com/xdebug/xdebug.org/blob/aff649f2c3ca303ad471e6ed9dd29c0db16d3e22/src/XdebugVersion.php#L186-L190
-         */
-        if (
-            preg_match('/Architecture([ =>\t]*)(x[0-9]*)/', $phpinfo, $m)
-            && array_key_exists(2, $m)
-            && $m[2] !== ''
-        ) {
-            $architecture = Architecture::parseArchitecture($m[2]);
-        }
-
+        $os              = $phpBinaryPath->operatingSystem();
+        $osFamily        = $phpBinaryPath->operatingSystemFamily();
+        $phpinfo         = $phpBinaryPath->phpinfo();
+        $architecture    = $phpBinaryPath->machineType();
         $windowsCompiler = null;
         $threadSafety    = ThreadSafetyMode::ThreadSafe;
 
@@ -106,6 +97,9 @@ class TargetPlatform
                     case 'VS17':
                         $windowsCompiler = WindowsCompiler::VS17;
                         break;
+                    case 'VS18':
+                        $windowsCompiler = WindowsCompiler::VS18;
+                        break;
                 }
             }
         }
@@ -122,6 +116,7 @@ class TargetPlatform
             $threadSafety,
             $makeParallelJobs,
             $windowsCompiler,
+            $phpizePath,
         );
     }
 }

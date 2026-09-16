@@ -17,6 +17,7 @@ use function str_starts_with;
 use function strlen;
 use function substr;
 
+/** @internal This is not public API for PIE, so should not be depended upon unless you accept the risk of BC breaks */
 class DetermineExtensionsRequired
 {
     public static function linkFilter(Link $link): bool
@@ -30,7 +31,7 @@ class DetermineExtensionsRequired
     }
 
     /** @return array<string, Link> */
-    public function forProject(Composer $composer): array
+    public function forProject(Composer $composer, bool $noDev = false): array
     {
         $requires          = [];
         $removeDevPackages = [];
@@ -43,8 +44,10 @@ class DetermineExtensionsRequired
             $removeDevPackages = $installedRepo->getDevPackageNames();
         }
 
-        foreach (array_filter($composer->getPackage()->getDevRequires(), [self::class, 'linkFilter']) as $require => $link) {
-            $requires[$require] = $link;
+        if (! $noDev) {
+            foreach (array_filter($composer->getPackage()->getDevRequires(), [self::class, 'linkFilter']) as $require => $link) {
+                $requires[$require] = $link;
+            }
         }
 
         $installedRepo = new InstalledRepository([$installedRepo, new RootPackageRepository(clone $composer->getPackage())]);

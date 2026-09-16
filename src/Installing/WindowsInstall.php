@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace Php\Pie\Installing;
 
+use Composer\IO\IOInterface;
+use FilesystemIterator;
 use Php\Pie\Downloading\DownloadedPackage;
 use Php\Pie\File\BinaryFile;
 use Php\Pie\File\WindowsDelete;
@@ -13,15 +15,18 @@ use RecursiveDirectoryIterator;
 use RecursiveIteratorIterator;
 use RuntimeException;
 use SplFileInfo;
-use Symfony\Component\Console\Output\OutputInterface;
 
 use function assert;
-use function copy;
 use function dirname;
 use function file_exists;
 use function is_file;
-use function mkdir;
+use function Safe\copy;
+use function Safe\mkdir;
+use function Safe\realpath;
+use function sprintf;
+use function str_contains;
 use function str_replace;
+use function str_starts_with;
 use function strlen;
 use function substr;
 
@@ -37,7 +42,8 @@ final class WindowsInstall implements Install
     public function __invoke(
         DownloadedPackage $downloadedPackage,
         TargetPlatform $targetPlatform,
-        OutputInterface $output,
+        BinaryFile|null $builtBinaryFile,
+        IOInterface $io,
         bool $attemptToSetupIniFile,
     ): BinaryFile {
         $extractedSourcePath = $downloadedPackage->extractedSourcePath;
@@ -46,21 +52,28 @@ final class WindowsInstall implements Install
         assert($sourcePdbName !== '');
 
         $destinationDllName = $this->copyExtensionDll($targetPlatform, $downloadedPackage, $sourceDllName);
-        $output->writeln('<info>Copied DLL to:</info> ' . $destinationDllName);
+        $io->write('<info>Copied DLL to:</info> ' . $destinationDllName);
 
         $destinationPdbName = $this->copyExtensionPdb($targetPlatform, $downloadedPackage, $sourcePdbName, $destinationDllName);
         if ($destinationPdbName !== null) {
-            $output->writeln('<info>Copied PDB to:</info> ' . $destinationPdbName);
+            $io->write('<info>Copied PDB to:</info> ' . $destinationPdbName);
         }
 
-        foreach (new RecursiveIteratorIterator(new RecursiveDirectoryIterator($extractedSourcePath)) as $file) {
+        $iterator = new RecursiveIteratorIterator(
+            new RecursiveDirectoryIterator($extractedSourcePath, FilesystemIterator::SKIP_DOTS),
+        );
+
+        foreach ($iterator as $file) {
             assert($file instanceof SplFileInfo);
 
             /**
-             * Skip directories, the main DLL, PDB
+             * Skip directories, the main DLL, PDB, and any symlinks the archive
+             * may have shipped (symlink-followed targets fall outside the source
+             * dir's containment guarantees).
              */
             if (
                 $file->isDir()
+                || $file->isLink()
                 || $this->normalisedPathsMatch($file->getPathname(), $sourceDllName)
                 || $this->normalisedPathsMatch($file->getPathname(), $sourcePdbName)
             ) {
@@ -69,13 +82,13 @@ final class WindowsInstall implements Install
 
             $destinationExtraDll = $this->copyDependencyDll($targetPlatform, $file);
             if ($destinationExtraDll !== null) {
-                $output->writeln('<info>Copied extra DLL:</info> ' . $destinationExtraDll);
+                $io->write('<info>Copied extra DLL:</info> ' . $destinationExtraDll);
 
                 continue;
             }
 
             $destinationPathname = $this->copyExtraFile($targetPlatform, $downloadedPackage, $file);
-            $output->writeln('<info>Copied extras:</info> ' . $destinationPathname);
+            $io->write('<info>Copied extras:</info> ' . $destinationPathname);
         }
 
         $binaryFile = BinaryFile::fromFileWithSha256Checksum($destinationDllName);
@@ -84,7 +97,7 @@ final class WindowsInstall implements Install
             $targetPlatform,
             $downloadedPackage,
             $binaryFile,
-            $output,
+            $io,
             $attemptToSetupIniFile,
         );
 
@@ -116,7 +129,9 @@ final class WindowsInstall implements Install
             WindowsDelete::usingMoveToTemp($destinationDllName);
         }
 
-        if (! copy($sourceDllName, $destinationDllName) || ! file_exists($destinationDllName) && ! is_file($destinationDllName)) {
+        copy($sourceDllName, $destinationDllName);
+
+        if (! file_exists($destinationDllName) && ! is_file($destinationDllName)) {
             throw new RuntimeException('Failed to install DLL to ' . $destinationDllName);
         }
 
@@ -143,7 +158,9 @@ final class WindowsInstall implements Install
         $destinationPdbName = str_replace('.dll', '.pdb', $destinationDllName);
         assert($destinationPdbName !== '');
 
-        if (! copy($sourcePdbName, $destinationPdbName) || ! file_exists($destinationPdbName) && ! is_file($destinationPdbName)) {
+        copy($sourcePdbName, $destinationPdbName);
+
+        if (! file_exists($destinationPdbName) && ! is_file($destinationPdbName)) {
             throw new RuntimeException('Failed to install PDB to ' . $destinationPdbName);
         }
 
@@ -166,7 +183,9 @@ final class WindowsInstall implements Install
 
         $destinationExtraDll = dirname($targetPlatform->phpBinaryPath->phpBinaryPath) . DIRECTORY_SEPARATOR . $file->getFilename();
 
-        if (! copy($file->getPathname(), $destinationExtraDll) || ! file_exists($destinationExtraDll) && ! is_file($destinationExtraDll)) {
+        copy($file->getPathname(), $destinationExtraDll);
+
+        if (! file_exists($destinationExtraDll) && ! is_file($destinationExtraDll)) {
             throw new RuntimeException('Failed to copy to ' . $destinationExtraDll);
         }
 
@@ -180,10 +199,20 @@ final class WindowsInstall implements Install
      */
     private function copyExtraFile(TargetPlatform $targetPlatform, DownloadedPackage $downloadedPackage, SplFileInfo $file): string
     {
-        $destinationFullFilename = dirname($targetPlatform->phpBinaryPath->phpBinaryPath) . DIRECTORY_SEPARATOR
+        $extrasRoot = dirname($targetPlatform->phpBinaryPath->phpBinaryPath) . DIRECTORY_SEPARATOR
             . 'extras' . DIRECTORY_SEPARATOR
-            . $downloadedPackage->package->extensionName()->name() . DIRECTORY_SEPARATOR
-            . substr($file->getPathname(), strlen($downloadedPackage->extractedSourcePath) + 1);
+            . $downloadedPackage->package->extensionName()->name();
+
+        $relativeName = substr($file->getPathname(), strlen($downloadedPackage->extractedSourcePath) + 1);
+
+        if (str_contains($relativeName, '..' . DIRECTORY_SEPARATOR) || str_starts_with($relativeName, '..')) {
+            throw new RuntimeException(sprintf(
+                'Refusing to copy extra file with traversal segment: %s',
+                $relativeName,
+            ));
+        }
+
+        $destinationFullFilename = $extrasRoot . DIRECTORY_SEPARATOR . $relativeName;
 
         $destinationPath = dirname($destinationFullFilename);
 
@@ -191,7 +220,19 @@ final class WindowsInstall implements Install
             mkdir($destinationPath, 0777, true);
         }
 
-        if (! copy($file->getPathname(), $destinationFullFilename) || ! file_exists($destinationFullFilename) && ! is_file($destinationFullFilename)) {
+        $destinationReal = realpath($destinationPath);
+        $extrasReal      = realpath($extrasRoot);
+
+        if (! str_starts_with($destinationReal . DIRECTORY_SEPARATOR, $extrasReal . DIRECTORY_SEPARATOR)) {
+            throw new RuntimeException(sprintf(
+                'Refusing to copy extra file: destination %s escapes extras root %s',
+                $destinationPath,
+                $extrasRoot,
+            ));
+        }
+
+        copy($file->getPathname(), $destinationFullFilename);
+        if (! file_exists($destinationFullFilename) && ! is_file($destinationFullFilename)) {
             throw new RuntimeException('Failed to copy to ' . $destinationFullFilename);
         }
 

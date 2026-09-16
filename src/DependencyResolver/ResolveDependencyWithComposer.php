@@ -6,6 +6,7 @@ namespace Php\Pie\DependencyResolver;
 
 use Composer\Composer;
 use Composer\Filter\PlatformRequirementFilter\PlatformRequirementFilterFactory;
+use Composer\IO\IOInterface;
 use Composer\Package\CompletePackageInterface;
 use Php\Pie\ComposerIntegration\QuieterConsoleIO;
 use Php\Pie\ComposerIntegration\VersionSelectorFactory;
@@ -14,12 +15,15 @@ use Php\Pie\Platform\TargetPlatform;
 use Php\Pie\Platform\ThreadSafetyMode;
 
 use function in_array;
-use function preg_match;
+use function Safe\preg_match;
+use function sprintf;
+use function str_ends_with;
 
 /** @internal This is not public API for PIE, so should not be depended upon unless you accept the risk of BC breaks */
 final class ResolveDependencyWithComposer implements DependencyResolver
 {
     public function __construct(
+        private readonly IOInterface $io,
         private readonly QuieterConsoleIO $arrayCollectionIo,
     ) {
     }
@@ -29,7 +33,7 @@ final class ResolveDependencyWithComposer implements DependencyResolver
         TargetPlatform $targetPlatform,
         RequestedPackageAndVersion $requestedPackageAndVersion,
         bool $forceInstallPackageVersion,
-    ): Package {
+    ): ResolvedPackageRequest {
         $versionSelector = VersionSelectorFactory::make($composer, $requestedPackageAndVersion, $targetPlatform);
 
         $package = $versionSelector->findBestCandidate(
@@ -62,10 +66,14 @@ final class ResolveDependencyWithComposer implements DependencyResolver
 
         $piePackage = Package::fromComposerCompletePackage($package);
 
-        $this->assertCompatibleOsFamily($targetPlatform, $piePackage);
-        $this->assertCompatibleThreadSafetyMode($targetPlatform->threadSafety, $piePackage);
+        $this->assertBuildProviderProvidersBundledExtensions($targetPlatform, $piePackage, $forceInstallPackageVersion);
 
-        return $piePackage;
+        if (! $forceInstallPackageVersion) {
+            $this->assertCompatibleOsFamily($targetPlatform, $piePackage);
+            $this->assertCompatibleThreadSafetyMode($targetPlatform->threadSafety, $piePackage);
+        }
+
+        return new ResolvedPackageRequest($piePackage, $requestedPackageAndVersion);
     }
 
     private function assertCompatibleThreadSafetyMode(ThreadSafetyMode $threadSafetyMode, Package $resolvedPackage): void
@@ -93,6 +101,78 @@ final class ResolveDependencyWithComposer implements DependencyResolver
                 $resolvedPackage->incompatibleOsFamilies(),
                 $targetPlatform->operatingSystemFamily,
             );
+        }
+    }
+
+    private function assertBuildProviderProvidersBundledExtensions(TargetPlatform $targetPlatform, Package $piePackage, bool $forceInstallPackageVersion): void
+    {
+        if (! $piePackage->isBundledPhpExtension()) {
+            return;
+        }
+
+        if (str_ends_with($targetPlatform->phpBinaryPath->phpVersionWithExtra(), '-dev')) {
+            throw BundledPhpExtensionRefusal::forPhpExtraVersion($targetPlatform->phpBinaryPath);
+        }
+
+        $buildProvider = $targetPlatform->phpBinaryPath->buildProvider();
+        if (! $buildProvider) {
+            return;
+        }
+
+        $identifiedBuildProvider = false;
+        $note                    = '<options=bold,underscore;fg=red>Note:</> ';
+
+        if ($buildProvider === 'https://github.com/docker-library/php') {
+            $identifiedBuildProvider = true;
+            $this->io->write(sprintf(
+                '<comment>%sYou should probably use "docker-php-ext-install %s" instead</comment>',
+                $note,
+                $piePackage->extensionName()->name(),
+            ));
+        }
+
+        if ($buildProvider === 'Debian') {
+            $identifiedBuildProvider = true;
+            $this->io->write(sprintf(
+                '<comment>%sYou should probably use "apt install php%s-%s" or "apt install php-%s" (or similar) instead</comment>',
+                $note,
+                $targetPlatform->phpBinaryPath->majorMinorVersion(),
+                $piePackage->extensionName()->name(),
+                $piePackage->extensionName()->name(),
+            ));
+        }
+
+        $rpmProviders = [
+            'AlmaLinux',
+            'CentOS',
+            'Fedora Project',
+            'Red Hat, Inc.',
+            '|^Remi\'s RPM repository <https://rpms.remirepo.net/>|',
+            'Rocky Enterprise Software Foundation',
+        ];
+        foreach ($rpmProviders as $rpmProvider) {
+            if ($buildProvider === $rpmProvider || ($rpmProvider[0] === '|' && preg_match($rpmProvider, $buildProvider))) {
+                $identifiedBuildProvider = true;
+                $this->io->write(sprintf(
+                    '<comment>%sYou should probably use "dnf install php-%s" instead</comment>',
+                    $note,
+                    $piePackage->extensionName()->name(),
+                ));
+                break;
+            }
+        }
+
+        if ($buildProvider === 'Homebrew') {
+            $identifiedBuildProvider = true;
+            $this->io->write(sprintf(
+                '<comment>%sThe bundled extension %s is likely already installed with Homebrew, and you should use that version.</comment>',
+                $note,
+                $piePackage->extensionName()->name(),
+            ));
+        }
+
+        if ($identifiedBuildProvider && ! $forceInstallPackageVersion) {
+            throw BundledPhpExtensionRefusal::forPackage($piePackage);
         }
     }
 }

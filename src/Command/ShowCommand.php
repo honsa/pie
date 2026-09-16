@@ -4,34 +4,36 @@ declare(strict_types=1);
 
 namespace Php\Pie\Command;
 
+use Composer\IO\IOInterface;
+use Composer\IO\NullIO;
+use InvalidArgumentException;
 use Php\Pie\ComposerIntegration\PieComposerFactory;
 use Php\Pie\ComposerIntegration\PieComposerRequest;
-use Php\Pie\ComposerIntegration\PieInstalledJsonMetadataKeys;
-use Php\Pie\File\BinaryFile;
-use Php\Pie\File\BinaryFileFailedVerification;
+use Php\Pie\DependencyResolver\BundledPhpExtensionRefusal;
+use Php\Pie\DependencyResolver\Package;
+use Php\Pie\DependencyResolver\RequestedPackageAndVersion;
+use Php\Pie\DependencyResolver\ResolveDependencyWithComposer;
+use Php\Pie\DependencyResolver\UnableToResolveRequirement;
 use Php\Pie\Platform as PiePlatform;
 use Php\Pie\Platform\InstalledPiePackages;
-use Php\Pie\Platform\OperatingSystem;
+use Php\Pie\Util\Emoji;
+use Php\Pie\Util\PackageVerificationStatus;
 use Psr\Container\ContainerInterface;
 use Symfony\Component\Console\Attribute\AsCommand;
 use Symfony\Component\Console\Command\Command;
 use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\Console\Input\InputOption;
-use Symfony\Component\Console\Output\NullOutput;
 use Symfony\Component\Console\Output\OutputInterface;
+use Webmozart\Assert\Assert;
 
 use function array_diff;
 use function array_key_exists;
-use function array_keys;
+use function array_map;
 use function array_walk;
 use function count;
-use function file_exists;
+use function rtrim;
 use function sprintf;
-use function substr;
 
-use const DIRECTORY_SEPARATOR;
-
-/** @psalm-import-type PieMetadata from PieInstalledJsonMetadataKeys */
 #[AsCommand(
     name: 'show',
     description: 'List the installed modules and their versions.',
@@ -43,6 +45,8 @@ final class ShowCommand extends Command
     public function __construct(
         private readonly InstalledPiePackages $installedPiePackages,
         private readonly ContainerInterface $container,
+        private readonly ResolveDependencyWithComposer $resolveDependencyWithComposer,
+        private readonly IOInterface $io,
     ) {
         parent::__construct();
     }
@@ -64,124 +68,145 @@ final class ShowCommand extends Command
     public function execute(InputInterface $input, OutputInterface $output): int
     {
         $showAll        = $input->hasOption(self::OPTION_ALL) && $input->getOption(self::OPTION_ALL);
-        $targetPlatform = CommandHelper::determineTargetPlatformFromInputs($input, $output);
+        $targetPlatform = CommandHelper::determineTargetPlatformFromInputs($input, $this->io);
 
-        if ($output->getVerbosity() < OutputInterface::VERBOSITY_VERBOSE) {
-            $output->writeln(
-                sprintf(
-                    '<info>Using pie.json:</info> %s',
-                    PiePlatform::getPieJsonFilename($targetPlatform),
-                ),
-            );
-        }
+        $this->io->write(
+            sprintf(
+                '<info>Using pie.json:</info> %s',
+                PiePlatform::getPieJsonFilename($targetPlatform),
+            ),
+            verbosity: IOInterface::VERBOSE,
+        );
 
         if (! $showAll) {
-            $output->writeln('Tip: to include extensions in this list that PIE does not manage, use the --all flag.');
+            $this->io->write('Tip: to include extensions in this list that PIE does not manage, use the --all flag.');
         }
+
+        CommandHelper::applyNoCacheOptionIfSet($input, $this->io);
 
         $composer = PieComposerFactory::createPieComposer(
             $this->container,
             PieComposerRequest::noOperation(
-                new NullOutput(),
+                new NullIO(),
                 $targetPlatform,
             ),
         );
 
         $piePackages          = $this->installedPiePackages->allPiePackages($composer);
         $phpEnabledExtensions = $targetPlatform->phpBinaryPath->extensions();
-        $extensionPath        = $targetPlatform->phpBinaryPath->extensionPath();
-        $extensionEnding      = $targetPlatform->operatingSystem === OperatingSystem::Windows ? '.dll' : '.so';
         $piePackagesMatched   = [];
+        $rootPackageRequires  = $composer->getPackage()->getRequires();
 
-        $output->writeln(sprintf(
+        $this->io->write(sprintf(
             "\n" . '<options=bold,underscore>%s:</>',
             $showAll ? 'All loaded extensions' : 'Loaded PIE extensions',
         ));
         array_walk(
             $phpEnabledExtensions,
-            static function (string $version, string $phpExtensionName) use ($showAll, $output, $piePackages, $extensionPath, $extensionEnding, &$piePackagesMatched): void {
-                if (! array_key_exists($phpExtensionName, $piePackages)) {
+            function (string $version, string $phpExtensionName) use ($composer, $rootPackageRequires, $targetPlatform, $showAll, $piePackages, &$piePackagesMatched): void {
+                $pieMatchesForExtension = $piePackages->findByPhpFormattedExtensionName($phpExtensionName);
+
+                if (! count($pieMatchesForExtension)) {
                     if ($showAll) {
-                        $output->writeln(sprintf('  <comment>%s:%s</comment>', $phpExtensionName, $version));
+                        $this->io->write(sprintf('  <comment>%s:%s</comment>', $phpExtensionName, $version));
                     }
 
                     return;
                 }
 
-                $piePackage           = $piePackages[$phpExtensionName];
-                $piePackagesMatched[] = $phpExtensionName;
+                foreach ($pieMatchesForExtension->packages() as $piePackage) {
+                    $packageName        = $piePackage->name();
+                    $verificationStatus = $piePackage->verifyPackageStatus($targetPlatform);
+                    $packageRequirement = array_key_exists($packageName, $rootPackageRequires) ? $rootPackageRequires[$packageName]->getPrettyConstraint() : null;
 
-                $output->writeln(sprintf(
-                    '  <info>%s:%s</info> (from 🥧 <info>%s</info>%s)',
-                    $phpExtensionName,
-                    $version,
-                    $piePackage->prettyNameAndVersion(),
-                    self::verifyChecksumInformation(
-                        $extensionPath,
+                    if ($verificationStatus === PackageVerificationStatus::InstalledBinaryMetadataMissing) {
+                        continue;
+                    }
+
+                    $piePackagesMatched[] = $packageName;
+
+                    try {
+                        // Don't check for updates for bundled PHP extensions
+                        if ($piePackage->isBundledPhpExtension()) {
+                            throw new BundledPhpExtensionRefusal();
+                        }
+
+                        Assert::stringNotEmpty($packageName);
+                        Assert::stringNotEmpty($packageRequirement);
+
+                        $latestConstrainedPackage = ($this->resolveDependencyWithComposer)(
+                            $composer,
+                            $targetPlatform,
+                            new RequestedPackageAndVersion($packageName, $packageRequirement),
+                            false,
+                        );
+
+                        $latestPackage = ($this->resolveDependencyWithComposer)(
+                            $composer,
+                            $targetPlatform,
+                            new RequestedPackageAndVersion($packageName, '*'),
+                            false,
+                        );
+                    } catch (UnableToResolveRequirement | BundledPhpExtensionRefusal | InvalidArgumentException) {
+                        $latestConstrainedPackage = null;
+                        $latestPackage            = null;
+                    }
+
+                    $updateNotice = '';
+                    if ($latestConstrainedPackage !== null && $latestConstrainedPackage->piePackage->version() !== $piePackage->version()) {
+                        $updateNotice = sprintf(
+                            ', upgradable to %s (within %s)',
+                            $latestConstrainedPackage->piePackage->version(),
+                            $packageRequirement,
+                        );
+                    }
+
+                    if ($latestPackage !== null && $latestPackage->piePackage->version() !== $latestConstrainedPackage->piePackage->version()) {
+                        $updateNotice .= sprintf(', latest version is %s', $latestPackage->piePackage->version());
+                    }
+
+                    if (! array_key_exists($packageName, $rootPackageRequires)) {
+                        $verificationStatus = PackageVerificationStatus::InstalledButDoesNotExistInRequires;
+                    }
+
+                    $this->io->write(sprintf(
+                        '  <info>%s:%s</info> (from 🥧 <info>%s</info> %s)%s',
                         $phpExtensionName,
-                        $extensionEnding,
-                        PieInstalledJsonMetadataKeys::pieMetadataFromComposerPackage($piePackage->composerPackage()),
-                    ),
-                ));
+                        $version,
+                        $piePackage->prettyNameAndVersion(),
+                        $verificationStatus->description(),
+                        $updateNotice,
+                    ));
+                }
             },
         );
 
         if (! $showAll && ! count($piePackagesMatched)) {
-            $output->writeln('(none)');
+            $this->io->write('(none)');
         }
 
-        $unmatchedPiePackages = array_diff(array_keys($piePackages), $piePackagesMatched);
+        $unmatchedPiePackageNames = array_diff(array_map(static fn (Package $piePackage) => $piePackage->name(), $piePackages->packages()), $piePackagesMatched);
 
-        if (count($unmatchedPiePackages)) {
-            $output->writeln("\n" . ' ⚠️ <options=bold,underscore>PIE packages not loaded:</>');
-            $output->writeln('These extensions were installed with PIE but are not currently enabled.' . "\n");
+        if (count($unmatchedPiePackageNames)) {
+            $this->io->write(sprintf(
+                '%s %s <options=bold,underscore>PIE packages not loaded:</>',
+                "\n",
+                Emoji::WARNING,
+            ));
+            $this->io->write('These extensions were set up with PIE but are not currently enabled.' . "\n");
 
-            foreach ($unmatchedPiePackages as $unmatchedPiePackage) {
-                $output->writeln(sprintf(' - %s', $piePackages[$unmatchedPiePackage]->prettyNameAndVersion()));
+            foreach ($unmatchedPiePackageNames as $unmatchedPiePackageName) {
+                $unmatchedPiePackage = $piePackages->findByPackageName($unmatchedPiePackageName);
+
+                $message = match ($unmatchedPiePackage->verifyPackageStatus($targetPlatform)) {
+                    PackageVerificationStatus::ChecksumMetadataMissing => '- was built but not installed yet.',
+                    PackageVerificationStatus::InstalledBinaryMetadataMissing => '- was downloaded but has not been built yet.',
+                    default => '- installed but not enabled in INI file',
+                };
+                $this->io->write(rtrim(sprintf(' - %s %s', $unmatchedPiePackage->prettyNameAndVersion(), $message)));
             }
         }
 
         return Command::SUCCESS;
-    }
-
-    /**
-     * @param PieMetadata $installedJsonMetadata
-     * @psalm-param '.dll'|'.so' $extensionEnding
-     */
-    private static function verifyChecksumInformation(
-        string $extensionPath,
-        string $phpExtensionName,
-        string $extensionEnding,
-        array $installedJsonMetadata,
-    ): string {
-        $actualBinaryPathByConvention = $extensionPath . DIRECTORY_SEPARATOR . $phpExtensionName . $extensionEnding;
-
-        // The extension may not be in the usual path (since you can specify a full path to an extension in the INI file)
-        if (! file_exists($actualBinaryPathByConvention)) {
-            return '';
-        }
-
-        $pieExpectedBinaryPath = array_key_exists(PieInstalledJsonMetadataKeys::InstalledBinary->value, $installedJsonMetadata) ? $installedJsonMetadata[PieInstalledJsonMetadataKeys::InstalledBinary->value] : null;
-        $pieExpectedChecksum   = array_key_exists(PieInstalledJsonMetadataKeys::BinaryChecksum->value, $installedJsonMetadata) ? $installedJsonMetadata[PieInstalledJsonMetadataKeys::BinaryChecksum->value] : null;
-
-        // Some other kind of mismatch of file path, or we don't have a stored checksum available
-        if (
-            $pieExpectedBinaryPath === null
-            || $pieExpectedChecksum === null
-            || $pieExpectedBinaryPath !== $actualBinaryPathByConvention
-        ) {
-            return '';
-        }
-
-        $expectedBinaryFileFromMetadata = new BinaryFile($pieExpectedBinaryPath, $pieExpectedChecksum);
-        $actualBinaryFile               = BinaryFile::fromFileWithSha256Checksum($actualBinaryPathByConvention);
-
-        try {
-            $expectedBinaryFileFromMetadata->verifyAgainstOther($actualBinaryFile);
-        } catch (BinaryFileFailedVerification) {
-            return ' ⚠️ was ' . substr($actualBinaryFile->checksum, 0, 8) . '..., expected ' . substr($expectedBinaryFileFromMetadata->checksum, 0, 8) . '...';
-        }
-
-        return ' ✅';
     }
 }

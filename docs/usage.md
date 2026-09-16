@@ -18,28 +18,52 @@ order: 2
 This documentation assumes you have moved `pie.phar` into your `$PATH`, e.g.
 `/usr/local/bin/pie` on non-Windows systems.
 
-### One-liner
+### Distribution packages
 
-Note that this does not verify any signatures, and you assume the risks in
-running this, but this will put PIE into `/usr/local/bin/pie` on a non-Windows
-system:
+> [!WARNING]
+> Distribution packages are not maintained by PIE, so may not have the latest version, may have patches applied, or
+> the instructions here may be out of date. You should verify the distribution packages before using them.
+
+#### Fedora and Enterprise Linux 10
+
+On Enterprise Linux (CentOS, RHEL, AlmaLinux, RockyLinux, and other clones) you
+need to enable the [EPEL](https://docs.fedoraproject.org/en-US/epel/) repository.
 
 ```shell
-curl -fL --output /tmp/pie.phar https://github.com/php/pie/releases/latest/download/pie.phar \
-  && gh attestation verify --owner php /tmp/pie.phar \
-  && sudo mv /tmp/pie.phar /usr/local/bin/pie \
-  && sudo chmod +x /usr/local/bin/pie
+sudo dnf install pie
+```
+
+Package information: [pie](https://src.fedoraproject.org/rpms/pie)
+
+#### Homebrew
+
+PIE can be installed with Homebrew with:
+
+```shell
+brew install pie
+
+# If you have `gh`, you can verify PIE is authentic:
+gh attestation verify --owner=php $(which pie)
 ```
 
 ### Docker installation
 
-PIE is published as binary-only Docker image, so you can install it easily during your Docker build:
+PIE is published as binary-only Docker image, so you can use it easily during your Docker build:
 
 ```Dockerfile
-COPY --from=ghcr.io/php/pie:bin /pie /usr/bin/pie
+RUN --mount=type=bind,from=ghcr.io/php/pie:bin,source=/pie,target=/usr/local/bin/pie \
+    pie -V
 ```
 
-Instead of `bin` tag (which represents latest binary-only image) you can also use explicit version (in `x.y.z-bin` format). Use [GitHub registry](https://ghcr.io/php/pie) to find available tags.
+The following tag styles (replace them with the real version you want!): are published from 1.5+:
+
+ * `bin` (latest _stable_, **recommended**)
+ * `nightly-bin` (latest _unstable_)
+ * `x.y.z-bin` (e.g. `1.5.0-bin`)
+ * `x.y-bin` (e.g. `1.5-bin`)
+ * `x-bin` (e.g. `1-bin`)
+
+Use [GitHub registry](https://ghcr.io/php/pie) to find available tags.
 
 > [!IMPORTANT]
 > Binary-only images don't include PHP runtime so you can't use them for _running_ PIE. This is just an alternative way of distributing PHAR file, you still need to satisfy PIE's runtime requirements on your own.
@@ -54,37 +78,96 @@ installed.
 ```Dockerfile
 FROM php:8.4-cli
 
-# Add the `unzip` package which PIE uses to extract .zip files
-RUN export DEBIAN_FRONTEND="noninteractive"; \
+RUN --mount=type=bind,from=ghcr.io/php/pie:bin,source=/pie,target=/usr/local/bin/pie \
+    export DEBIAN_FRONTEND="noninteractive"; \
     set -eux; \
-    apt-get update; apt-get install -y --no-install-recommends unzip; \
-    rm -rf /var/lib/apt/lists/*
+    # Add the `unzip` package which PIE uses to extract .zip files.
+    apt-get update; \
+    apt-get install -y --no-install-recommends unzip; \
+    # Use PIE to install an extension...
+    pie install --no-cache \
+        asgrim/example-pie-extension; \
+    # Clean up `unzip`.
+    apt-get purge -y --auto-remove -o APT::AutoRemove::RecommendsImportant=false unzip; \
+    rm -rf /var/lib/apt/lists/*;
 
-# Copy the pie.phar from the latest `:bin` release
-COPY --from=ghcr.io/php/pie:bin /pie /usr/bin/pie
-
-# Use PIE to install an extension...
-RUN pie install asgrim/example-pie-extension
+CMD ["php", "-r", "example_pie_extension_test();"]
 ```
 
 If the extension you would like to install needs additional libraries or other
 dependencies, then these must be installed beforehand too.
 
-## Prerequisites for PIE
+### Executable PIE (Experimental)
+
+As of 1.4.0 an **experimental** executable (binary) version of PIE is included.
+The PIE is built using [Static PHP](https://static-php.dev/), which builds a
+self-contained PHP executable with the extensions that PIE needs to run, and
+bundles the PHAR as a single distributable executable. Please keep in mind that
+this is **experimental**, and we do not recommend this for production use for
+the time being. Please also note there are some limitations:
+
+ - [php/pie#460](https://github.com/php/pie/discussions/460) - all the binary
+   versions have the `pie self-update` feature disabled for now.
+
+If you find the binary releases useful, please leave feedback or upvote on the
+relevant discussions, so we can gauge interest in improving this functionality.
+
+The stable versions of the executables can be found by navigating to the
+[relevant release](https://github.com/php/pie/releases), and finding the
+appropriate executable for your platform. For your convenience, the "latest"
+stable releases can be downloaded from these links:
+
+| Operating System | Architecture     | Download URL                                                            |
+|------------------|------------------|-------------------------------------------------------------------------|
+| Linux            | amd64 / x86_64   | https://github.com/php/pie/releases/latest/download/pie-Linux-X64       |
+| OS X             | ARM 64 / aarch64 | https://github.com/php/pie/releases/latest/download/pie-macOS-ARM64     |
+| Linux            | ARM 64 / aarch64 | https://github.com/php/pie/releases/latest/download/pie-Linux-ARM64     |
+
+The "nightly" versions of these can be found here:
+
+| Operating System | Architecture     | Download URL                                  |
+|------------------|------------------|-----------------------------------------------|
+| Linux            | amd64 / x86_64   | https://php.github.io/pie/pie-Linux-X64       |
+| OS X             | ARM 64 / aarch64 | https://php.github.io/pie/pie-macOS-ARM64     |
+| Linux            | ARM 64 / aarch64 | https://php.github.io/pie/pie-Linux-ARM64     |
+
+We *highly* recommend you verify the file came from the PHP GitHub repository
+before running it, for example:
+
+```shell
+$ gh attestation verify --owner php pie-Linux-X64
+$ chmod +x pie-Linux-X64
+$ ./pie-Linux-X64 --version
+```
+
+## Prerequisites for PIE (PHAR distribution)
 
 Running PIE requires PHP 8.1 or newer. However, you may still use PIE to install
-an extension for an older version of PHP.
+an extension for an older version of PHP. You also need the `zip` extension
+enabled for the PHP version running PIE, or `git` to download the extension
+source code.
 
-Additionally to PHP, PIE requires the following tools to be available on your
-system in order to download, build and install extensions:
+Additionally to PHP, PIE requires the following build tools to be available on
+your system in order to download, build and install extensions. Note that as of
+PIE 1.4.0, PIE will attempt to detect and install the missing build tools:
 
-- The `zip` extension enabled for the PHP version running PIE, or `git` to
-  download the extension source code
 - `autoconf`, `automake`, `libtool`, `m4`, `make`, and `gcc` to build the extension
 - PHP development tools (such as `php-config` and `phpize`) to prepare the
   extension for building.
 
-Also, each extension may have its own requirements, such as additional libraries.
+Also, each extension may have its own requirements, such as additional
+libraries. As of PIE 1.4.0, for some extensions, PIE will attempt to detect and
+install the missing system libraries.
+
+> [!TIP]
+> If you run PIE without the correct prerequisites installed, you may receive
+> an error from the *Box Requirements Checker*. If you want to try running
+> anyway, specify the environment variable `BOX_REQUIREMENT_CHECKER=0`.
+>
+> Example on Linux:
+> ```shell
+> $ BOX_REQUIREMENT_CHECKER=0 pie install foo/bar
+> ```
 
 ### Using Linux
 
@@ -124,7 +207,18 @@ PIE has the ability to:
 
 When installing an extension with PIE, you must use its Composer package name.
 You can find a list of PIE-compatible packages on
-[https://packagist.org/extensions](https://packagist.org/extensions).
+[https://packagist.org/extensions](https://packagist.org/extensions), or by
+searching with `pie search <term>` (from PIE 1.5.0+):
+
+```shell
+$ pie search xdebug
+🥧 PHP Installer for Extensions (PIE) 1.5.0-rc.3, from The PHP Foundation
+You are running PHP 8.5.10
+Target PHP installation: 8.5.10 nts, on Linux/OSX/etc x86_64 (from /usr/bin/php8.5)
+
+Found 1 package(s) matching "xdebug":
+ - xdebug/xdebug (provides extension: xdebug): Xdebug is a debugging and productivity extension for PHP
+```
 
 Once you know the extension name, you can install it with:
 
@@ -138,6 +232,10 @@ pie install xdebug/xdebug
 This will install the Xdebug extension into the version of PHP that is used to
 invoke PIE, using whichever is the latest stable version of Xdebug compatible
 with that version of PHP.
+
+> [!TIP]
+> If PIE detects the extension of the same version with the same configure flags
+> is already installed, as of PIE 1.5, it will no longer be re-installed.
 
 ### Using PIE to install an extension for a different PHP version
 
@@ -234,6 +332,56 @@ pie install example/some-extension --with-some-library-name=/path/to/the/lib
 pie install example/some-extension --with-some-library-name=/path/to/the/lib --enable-some-functionality
 ```
 
+> [!TIP]
+> If you specify configure options for a package that uses the
+> `pre-packaged-binary` download method, PIE will fall back to compiling the
+> extension using the configure options you have specified.
+
+### Build tools check
+
+PIE will attempt to check the presence of build tools (such as gcc, make, etc.)
+before running. If any are missing, an interactive prompt will ask if you would
+like to install the missing tools. If you are running in non-interactive mode
+(for example, in a CI pipeline, container build, etc), PIE will **not**
+install these tools automatically. If you would like to install the build tools
+in a non-interactive terminal, pass the `--auto-install-build-tools` and the
+prompt will be skipped.
+
+From PIE 1.5.0 you can run this check separately with `pie check-build-tools`:
+
+```bash
+$ pie check-build-tools
+🥧 PHP Installer for Extensions (PIE) 1.5.0-rc.3, from The PHP Foundation
+You are running PHP 8.5.10
+Target PHP installation: 8.5.10 nts, on Linux/OSX/etc x86_64 (from /usr/bin/php8.5)
+
+Build tools typically required to build extensions:
+  ✅ cc/gcc
+  ✅ make
+  ✅ autoconf
+  ✅ pkg-config
+  ✅ libtoolize/glibtoolize
+  ✅ unzip
+  ✅ phpize
+
+✅ All build tools are installed.
+```
+
+To skip the build tools check entirely, pass the `--no-build-tools-check` flag.
+
+### System library dependencies check
+
+PIE will attempt to check the presence of system library dependencies before
+installing an extension. If any are missing, an interactive prompt will ask if
+you would like to install the missing tools. If you are running in
+non-interactive mode (for example, in a CI pipeline, container build, etc), PIE
+will **not** install these dependencies automatically. If you would like to
+install the system dependencies in a non-interactive terminal, pass the
+`--auto-install-system-dependencies` and the prompt will be skipped.
+
+To skip the dependencies check entirely, pass the
+`--no-system-dependencies-check` flag.
+
 ### Configuring the INI file
 
 PIE will automatically try to enable the extension by adding `extension=...` or
@@ -288,29 +436,104 @@ like to install one. For example:
 
 ```
 $ pie install
-🥧 PHP Installer for Extensions (PIE), 0.9.0, from The PHP Foundation
-You are running PHP 8.3.19
-Target PHP installation: 8.3.19 nts, on Linux/OSX/etc x86_64 (from /usr/bin/php8.3)
-Checking extensions for your project your-vendor/your-project
-requires: curl ✅ Already installed
-requires: intl ✅ Already installed
-requires: json ✅ Already installed
-requires: example_pie_extension ⚠️  Missing
+🥧 PHP Installer for Extensions (PIE) 1.4.0, from The PHP Foundation
+You are running PHP 8.5.0
+Target PHP installation: 8.5.0 nts, on Linux/OSX/etc x86_64 (from /usr/local/bin/php)
+Checking extensions for your project asgrim/demo-php-project (path: /demos/demo-php-project)
+requires: ext-curl:* ✅ Already installed
+requires: ext-example_pie_extension:^2.0 🚫 Missing
 
-The following packages may be suitable, which would you like to install:
+The following packages may be suitable, which would you like to install: 
   [0] None
   [1] asgrim/example-pie-extension: Example PIE extension
  > 1
-   > 🥧 PHP Installer for Extensions (PIE), 0.9.0, from The PHP Foundation
-   > This command may need elevated privileges, and may prompt you for your password.
-   > You are running PHP 8.3.19
-   > Target PHP installation: 8.3.19 nts, on Linux/OSX/etc x86_64 (from /usr/bin/php8.3)
-   > Found package: asgrim/example-pie-extension:2.0.2 which provides ext-example_pie_extension
-   ... (snip) ...
-   > ✅ Extension is enabled and loaded in /usr/bin/php8.3
+  example_pie_extension> You are running PHP 8.5.0
+  example_pie_extension> Target PHP installation: 8.5.0 nts, on Linux/OSX/etc x86_64 (from /usr/local/bin/php)
+  example_pie_extension> Found package: asgrim/example-pie-extension:2.0.9 which provides ext-example_pie_extension
+  example_pie_extension> Extracted asgrim/example-pie-extension:2.0.9 source to: /path/to/example-pie-extension
+  example_pie_extension> phpize complete.
+  example_pie_extension> Configure complete with options: --with-php-config=/usr/local/bin/php-config
+  example_pie_extension> Build complete: /path/to/example-pie-extension/modules/example_pie_extension.so
+  example_pie_extension> Install complete: /usr/local/lib/php/extensions/no-debug-non-zts-20250925/example_pie_extension.so
+  example_pie_extension> ✅ Extension is enabled and loaded in /usr/local/bin/php
 
 Finished checking extensions.
 ```
+
+### Telling PIE which packages to use for missing extensions
+
+You can provide PIE a map of which packages to use for each missing extension
+using the new `--select` option in PIE 1.5+. For example, if your PHP project
+has dependencies:
+
+```json
+{
+    "require": {
+        "ext-curl": "*",
+        "ext-example_pie_extension": "^2.0",
+        "ext-redis": "^6.3"
+    }
+}
+```
+
+You can specify the missing extensions with:
+
+```bash
+pie install \
+  --select example_pie_extension=asgrim/example-pie-extension \
+  --select redis=phpredis/phpredis
+```
+
+> [!IMPORTANT]
+> The `--allow-non-interactive-project-install` will no longer work. You must
+> provide package selections from PIE 1.5 onwards.
+
+### Excluding require-dev extensions
+
+By default, PIE checks extensions declared in both `require` and
+`require-dev`. To skip extensions that are only declared in `require-dev`
+(for example, `ext-xdebug` in a production build), pass `--no-dev`:
+
+```bash
+pie install --no-dev
+```
+
+## Install extensions from pie.lock
+
+If you have an existing `pie.json` and `pie.lock` for a given PHP install,
+place these files in the directory indicated by the `pie show -v` path for
+`Using pie.json`, e.g.:
+
+```bash
+$ php8.2 /usr/local/bin/pie show -v
+🥧 PHP Installer for Extensions (PIE) 1.5.0, from The PHP Foundation
+You are running PHP 8.2.31
+Target PHP installation: 8.2.31 nts, on Linux/OSX/etc x86_64 (from /usr/bin/php8.2)
+Using pie.json: /home/blah/.config/pie/php8.2_7cfa96d5dfc1df10afeb65851159197b/pie.json
+...
+```
+
+Move your `pie.json` and `pie.lock` into this path, then you can run
+`pie install --from-lock` which will install the locked extension dependencies
+specified in that `pie.lock`.
+
+## Update all PIE extensions
+
+You can now conveniently update all extensions that have been installed with
+PIE, by using `pie upgrade` for a target PHP install. PIE will check to see if
+all the PIE-enabled extensions for your PHP install have updates available
+within the constraints each extension was originally installed with. This is
+ideal where an extension supports [Semantic Versioning](https://semver.org/),
+for example:
+
+ - PIE extension `foo/bar` was installed like `pie install foo/bar:^1.0`
+ - PIE installed version `1.0.5` of `foo/bar`
+ - When you later run `pie upgrade`, PIE picks up a new release `1.1.0`, and
+   will install this new version
+ - Later again, you run `pie upgrade`. There is a new `2.0.0` release, but PIE
+   will not install this version, since it does not match the original
+   constraint you used. To upgrade to the `2.0.0` release, you would have to
+   run `pie install foo/bar:^2.0`, for example.
 
 ## Comparison with PECL
 
@@ -319,51 +542,51 @@ you may be familiar with in PECL, with an approximate equivalent in PIE. Note
 that some concepts are different or omitted from PIE as they may simply be not
 applicable to the new tooling.
 
-| PECL                           | PIE                                                                                                                     |
-|--------------------------------|-------------------------------------------------------------------------------------------------------------------------|
-| `pecl build xdebug`            | `pie build xdebug/xdebug`                                                                                               |
-| `pecl bundle xdebug`           | `pie download xdebug/xdebug`                                                                                            |
-| `pecl channel-add channel.xml` | `pie repository:add vcs https://github.com/my/extension`                                                                |
-| `pecl channel-alias`           |                                                                                                                         |
-| `pecl channel-delete channel`  | `pie repository:remove https://github.com/my/extension`                                                                 |
-| `pecl channel-discover`        |                                                                                                                         |
-| `pecl channel-login`           |                                                                                                                         |
-| `pecl channel-logout`          |                                                                                                                         |
-| `pecl channel-update`          |                                                                                                                         |
-| `pecl clear-cache`             |                                                                                                                         |
-| `pecl config-create`           |                                                                                                                         |
-| `pecl config-get`              |                                                                                                                         |
-| `pecl config-help`             |                                                                                                                         |
-| `pecl config-set`              |                                                                                                                         |
-| `pecl config-show`             |                                                                                                                         |
-| `pecl convert`                 |                                                                                                                         |
-| `pecl cvsdiff`                 |                                                                                                                         |
-| `pecl cvstag`                  |                                                                                                                         |
-| `pecl download xdebug`         | `pie download xdebug/xdebug`                                                                                            |
-| `pecl download-all`            |                                                                                                                         |
-| `pecl info xdebug`             | `pie info xdebug/xdebug`                                                                                                |
-| `pecl install xdebug`          | `pie install xdebug/xdebug`                                                                                             |
-| `pecl list`                    | `pie show`                                                                                                              |
-| `pecl list-all`                | Visit [Packagist Extension list](https://packagist.org/extensions)                                                      |
-| `pecl list-channels`           | `pie repository:list`                                                                                                   |
-| `pecl list-files`              |                                                                                                                         |
-| `pecl list-upgrades`           |                                                                                                                         |
-| `pecl login`                   |                                                                                                                         |
-| `pecl logout`                  |                                                                                                                         |
-| `pecl makerpm`                 |                                                                                                                         |
+| PECL                           | PIE                                                                                                                      |
+|--------------------------------|--------------------------------------------------------------------------------------------------------------------------|
+| `pecl build xdebug`            | `pie build xdebug/xdebug`                                                                                                |
+| `pecl bundle xdebug`           | `pie download xdebug/xdebug`                                                                                             |
+| `pecl channel-add channel.xml` | `pie repository:add vcs https://github.com/my/extension`                                                                 |
+| `pecl channel-alias`           |                                                                                                                          |
+| `pecl channel-delete channel`  | `pie repository:remove https://github.com/my/extension`                                                                  |
+| `pecl channel-discover`        |                                                                                                                          |
+| `pecl channel-login`           |                                                                                                                          |
+| `pecl channel-logout`          |                                                                                                                          |
+| `pecl channel-update`          |                                                                                                                          |
+| `pecl clear-cache`             |                                                                                                                          |
+| `pecl config-create`           |                                                                                                                          |
+| `pecl config-get`              |                                                                                                                          |
+| `pecl config-help`             |                                                                                                                          |
+| `pecl config-set`              |                                                                                                                          |
+| `pecl config-show`             |                                                                                                                          |
+| `pecl convert`                 |                                                                                                                          |
+| `pecl cvsdiff`                 |                                                                                                                          |
+| `pecl cvstag`                  |                                                                                                                          |
+| `pecl download xdebug`         | `pie download xdebug/xdebug`                                                                                             |
+| `pecl download-all`            |                                                                                                                          |
+| `pecl info xdebug`             | `pie info xdebug/xdebug`                                                                                                 |
+| `pecl install xdebug`          | `pie install xdebug/xdebug`                                                                                              |
+| `pecl list`                    | `pie show`                                                                                                               |
+| `pecl list-all`                | Visit [Packagist Extension list](https://packagist.org/extensions)                                                       |
+| `pecl list-channels`           | `pie repository:list`                                                                                                    |
+| `pecl list-files`              |                                                                                                                          |
+| `pecl list-upgrades`           |                                                                                                                          |
+| `pecl login`                   |                                                                                                                          |
+| `pecl logout`                  |                                                                                                                          |
+| `pecl makerpm`                 |                                                                                                                          |
 | `pecl package`                 | Linux - just tag a release. Windows - use [`php/php-windows-builder` action](https://github.com/php/php-windows-builder) |
-| `pecl package-dependencies`    |                                                                                                                         |
-| `pecl package-validate`        | In your extension checkout: `composer validate`                                                                         |
-| `pecl pickle`                  |                                                                                                                         |
-| `pecl remote-info xdebug`      | `pie info xdebug/xdebug`                                                                                                |
-| `pecl remote-list`             | Visit [Packagist Extension list](https://packagist.org/extensions)                                                      |
-| `pecl run-scripts`             |                                                                                                                         |
-| `pecl run-tests`               |                                                                                                                         |
-| `pecl search`                  | Visit [Packagist Extension list](https://packagist.org/extensions)                                                      |
-| `pecl shell-test`              |                                                                                                                         |
-| `pecl sign`                    |                                                                                                                         |
-| `pecl svntag`                  |                                                                                                                         |
-| `pecl uninstall`               |                                                                                                                         |
-| `pecl update-channels`         |                                                                                                                         |
-| `pecl upgrade xdebug`          | `pie install xdebug/xdebug`                                                                                             |
-| `pecl upgrade-all`             |                                                                                                                         |
+| `pecl package-dependencies`    |                                                                                                                          |
+| `pecl package-validate`        | In your extension checkout: `composer validate`                                                                          |
+| `pecl pickle`                  |                                                                                                                          |
+| `pecl remote-info xdebug`      | `pie info xdebug/xdebug`                                                                                                 |
+| `pecl remote-list`             | Visit [Packagist Extension list](https://packagist.org/extensions)                                                       |
+| `pecl run-scripts`             |                                                                                                                          |
+| `pecl run-tests`               |                                                                                                                          |
+| `pecl search`                  | `pie search <term>`                                                                                                      |
+| `pecl shell-test`              |                                                                                                                          |
+| `pecl sign`                    |                                                                                                                          |
+| `pecl svntag`                  |                                                                                                                          |
+| `pecl uninstall`               |                                                                                                                          |
+| `pecl update-channels`         |                                                                                                                          |
+| `pecl upgrade xdebug`          | `pie install xdebug/xdebug`                                                                                              |
+| `pecl upgrade-all`             | `pie upgrade`                                                                                                            |

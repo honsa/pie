@@ -5,8 +5,10 @@ declare(strict_types=1);
 namespace Php\PieUnitTest\DependencyResolver;
 
 use Composer\Package\CompletePackage;
+use Composer\Package\CompletePackageInterface;
 use InvalidArgumentException;
 use Php\Pie\DependencyResolver\Package;
+use Php\Pie\Downloading\DownloadUrlMethod;
 use Php\Pie\ExtensionName;
 use Php\Pie\ExtensionType;
 use Php\Pie\Platform\OperatingSystemFamily;
@@ -124,7 +126,7 @@ final class PackageTest extends TestCase
     public function testGithubOrgAndRepo(string $composerPackageName, string|null $downloadUrl, string $expectedGithubOrgAndRepo): void
     {
         $package = new Package(
-            $this->createMock(CompletePackage::class),
+            $this->createMock(CompletePackageInterface::class),
             ExtensionType::PhpModule,
             ExtensionName::normaliseFromString('foo'),
             $composerPackageName,
@@ -144,5 +146,67 @@ final class PackageTest extends TestCase
 
         self::assertSame('vendor/foo:1.2.3', $package->prettyNameAndVersion());
         self::assertSame('some/subdirectory/path/', $package->buildPath());
+    }
+
+    public function testFromComposerCompletePackageWithAbsoluteBuildPathUnixThrows(): void
+    {
+        $composerCompletePackage = new CompletePackage('vendor/foo', '1.2.3.0', '1.2.3');
+        $composerCompletePackage->setPhpExt(['build-path' => '/absolute/path']);
+
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage('php-ext.build-path must be a relative path.');
+
+        Package::fromComposerCompletePackage($composerCompletePackage);
+    }
+
+    public function testFromComposerCompletePackageWithAbsoluteBuildPathWindowsThrows(): void
+    {
+        $composerCompletePackage = new CompletePackage('vendor/foo', '1.2.3.0', '1.2.3');
+        $composerCompletePackage->setPhpExt(['build-path' => 'C:\absolute\path']);
+
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage('php-ext.build-path must be a relative path.');
+
+        Package::fromComposerCompletePackage($composerCompletePackage);
+    }
+
+    public function testFromComposerCompletePackageWithTraversalBuildPathThrows(): void
+    {
+        $composerCompletePackage = new CompletePackage('vendor/foo', '1.2.3.0', '1.2.3');
+        $composerCompletePackage->setPhpExt(['build-path' => '../traversal']);
+
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage('php-ext.build-path cannot contain ".." segments.');
+
+        Package::fromComposerCompletePackage($composerCompletePackage);
+    }
+
+    public function testDownloadUrlMethodWithStringHasValidDownloadUrlMethod(): void
+    {
+        $composerCompletePackage = new CompletePackage('vendor/foo', '1.2.3.0', '1.2.3');
+        $composerCompletePackage->setPhpExt(['download-url-method' => 'pre-packaged-binary']);
+
+        self::assertSame(
+            [DownloadUrlMethod::PrePackagedBinary],
+            Package::fromComposerCompletePackage($composerCompletePackage)->supportedDownloadUrlMethods(),
+        );
+    }
+
+    public function testFromComposerCompletePackageWithListDownloadUrlMethods(): void
+    {
+        $composerCompletePackage = new CompletePackage('vendor/foo', '1.2.3.0', '1.2.3');
+        $composerCompletePackage->setPhpExt(['download-url-method' => ['pre-packaged-binary', 'composer-default']]);
+
+        self::assertSame(
+            [DownloadUrlMethod::PrePackagedBinary, DownloadUrlMethod::ComposerDefaultDownload],
+            Package::fromComposerCompletePackage($composerCompletePackage)->supportedDownloadUrlMethods(),
+        );
+    }
+
+    public function testFromComposerCompletePackageWithOmittedDownloadUrlMethod(): void
+    {
+        self::assertNull(Package::fromComposerCompletePackage(
+            new CompletePackage('vendor/foo', '1.2.3.0', '1.2.3'),
+        )->supportedDownloadUrlMethods());
     }
 }

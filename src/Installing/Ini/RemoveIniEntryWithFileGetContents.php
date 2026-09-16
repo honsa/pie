@@ -4,22 +4,25 @@ declare(strict_types=1);
 
 namespace Php\Pie\Installing\Ini;
 
+use Composer\IO\IOInterface;
 use Php\Pie\DependencyResolver\Package;
 use Php\Pie\ExtensionType;
 use Php\Pie\File\FailedToWriteFile;
 use Php\Pie\File\SudoFilePut;
 use Php\Pie\Platform\TargetPlatform;
-use Symfony\Component\Console\Output\OutputInterface;
+use Webmozart\Assert\Assert;
 
 use function array_filter;
 use function array_map;
 use function array_merge;
 use function array_walk;
 use function file_exists;
-use function file_get_contents;
 use function in_array;
-use function preg_replace;
-use function scandir;
+use function is_dir;
+use function preg_quote;
+use function Safe\file_get_contents;
+use function Safe\preg_replace;
+use function Safe\scandir;
 use function sprintf;
 
 use const DIRECTORY_SEPARATOR;
@@ -28,7 +31,7 @@ use const DIRECTORY_SEPARATOR;
 class RemoveIniEntryWithFileGetContents implements RemoveIniEntry
 {
     /** @return list<string> Returns a list of INI files that were updated to remove the extension */
-    public function __invoke(Package $package, TargetPlatform $targetPlatform, OutputInterface $output): array
+    public function __invoke(Package $package, TargetPlatform $targetPlatform, IOInterface $io): array
     {
         $allIniFiles = [];
 
@@ -38,14 +41,17 @@ class RemoveIniEntryWithFileGetContents implements RemoveIniEntry
         }
 
         $additionalIniDirectory = $targetPlatform->phpBinaryPath->additionalIniDirectory();
-        if ($additionalIniDirectory !== null) {
+        if ($additionalIniDirectory !== null && file_exists($additionalIniDirectory) && is_dir($additionalIniDirectory)) {
+            $filenames = scandir($additionalIniDirectory);
+            Assert::isList($filenames);
+            Assert::allString($filenames);
             $allIniFiles = array_merge(
                 array_map(
                     static function (string $path) use ($additionalIniDirectory): string {
                         return $additionalIniDirectory . DIRECTORY_SEPARATOR . $path;
                     },
                     array_filter(
-                        scandir($additionalIniDirectory),
+                        $filenames,
                         static function (string $path) use ($additionalIniDirectory): bool {
                             if (in_array($path, ['.', '..'])) {
                                 return false;
@@ -62,19 +68,23 @@ class RemoveIniEntryWithFileGetContents implements RemoveIniEntry
         // Make sure all symlinks are resolved
         $allIniFiles = array_filter(array_map('realpath', $allIniFiles));
 
+        // Anchor on the right with \b so uninstalling `foo` doesn't also
+        // rewrite the prefix of `extension=foo_other`. preg_quote on the
+        // extension name is defence-in-depth in case future ExtensionName
+        // validation ever loosens past `^[A-Za-z][a-zA-Z0-9_]+$`.
         $regex = sprintf(
-            '/^(%s\s*=\s*%s)/m',
+            '/^(%s\s*=\s*%s)\b/m',
             $package->extensionType() === ExtensionType::PhpModule ? 'extension' : 'zend_extension',
-            $package->extensionName()->name(),
+            preg_quote($package->extensionName()->name(), '/'),
         );
 
         $updatedIniFiles = [];
         array_walk(
             $allIniFiles,
-            static function (string $iniFile) use (&$updatedIniFiles, $regex, $package, $output): void {
+            static function (string $iniFile) use (&$updatedIniFiles, $regex, $package, $io): void {
                 $currentContent = file_get_contents($iniFile);
 
-                if ($currentContent === false || $currentContent === '') {
+                if ($currentContent === '') {
                     return;
                 }
 
@@ -84,14 +94,14 @@ class RemoveIniEntryWithFileGetContents implements RemoveIniEntry
                     $currentContent,
                 );
 
-                if ($replacedContent === null || $replacedContent === $currentContent) {
+                if ($replacedContent === $currentContent) {
                     return;
                 }
 
                 try {
                     SudoFilePut::contents($iniFile, $replacedContent);
                 } catch (FailedToWriteFile) {
-                    $output->writeln(sprintf(
+                    $io->writeError(sprintf(
                         '<error>Failed to remove extension "%s" from INI file "%s"</error>',
                         $package->extensionName()->name(),
                         $iniFile,

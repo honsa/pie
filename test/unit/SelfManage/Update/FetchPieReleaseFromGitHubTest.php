@@ -4,114 +4,88 @@ declare(strict_types=1);
 
 namespace Php\PieUnitTest\SelfManage\Update;
 
-use Composer\Util\AuthHelper;
 use Composer\Util\Http\Response;
 use Composer\Util\HttpDownloader;
 use Php\Pie\SelfManage\Update\FetchPieReleaseFromGitHub;
-use Php\Pie\SelfManage\Update\ReleaseMetadata;
 use PHPUnit\Framework\Attributes\CoversClass;
+use PHPUnit\Framework\Attributes\DataProvider;
+use PHPUnit\Framework\MockObject\MockObject;
 use PHPUnit\Framework\TestCase;
+use RuntimeException;
+use Throwable;
+use Webmozart\Assert\InvalidArgumentException;
 
-use function file_get_contents;
-use function hash;
-use function json_encode;
-use function uniqid;
+use function sprintf;
 
 #[CoversClass(FetchPieReleaseFromGitHub::class)]
 final class FetchPieReleaseFromGitHubTest extends TestCase
 {
-    private const TEST_GITHUB_URL = 'http://test-github-url.localhost';
+    private HttpDownloader&MockObject $httpDownloader;
+    private FetchPieReleaseFromGitHub $fetcher;
 
-    public function testLatestReleaseMetadata(): void
+    protected function setUp(): void
     {
-        $httpDownloader = $this->createMock(HttpDownloader::class);
-        $authHelper     = $this->createMock(AuthHelper::class);
-
-        $url = self::TEST_GITHUB_URL . '/repos/php/pie/releases/latest';
-        $authHelper
-            ->method('addAuthenticationHeader')
-            ->willReturn(['Authorization: Bearer fake-token']);
-        $httpDownloader->expects(self::once())
-            ->method('get')
-            ->with(
-                $url,
-                [
-                    'retry-auth-failure' => true,
-                    'http' => [
-                        'method' => 'GET',
-                        'header' => ['Authorization: Bearer fake-token'],
-                    ],
-                ],
-            )
-            ->willReturn(
-                new Response(
-                    ['url' => $url],
-                    200,
-                    [],
-                    json_encode([
-                        'tag_name' => '1.2.3',
-                        'assets' => [
-                            [
-                                'name' => 'not-pie.phar',
-                                'browser_download_url' => self::TEST_GITHUB_URL . '/do/not/download/this',
-                            ],
-                            [
-                                'name' => 'pie.phar',
-                                'browser_download_url' => self::TEST_GITHUB_URL . '/path/to/pie.phar',
-                            ],
-                        ],
-                    ]),
-                ),
-            );
-
-        $fetch = new FetchPieReleaseFromGitHub(self::TEST_GITHUB_URL, $httpDownloader, $authHelper);
-
-        $latestRelease = $fetch->latestReleaseMetadata();
-
-        self::assertSame('1.2.3', $latestRelease->tag);
-        self::assertSame(self::TEST_GITHUB_URL . '/path/to/pie.phar', $latestRelease->downloadUrl);
+        $this->httpDownloader = $this->createMock(HttpDownloader::class);
+        $this->fetcher        = new FetchPieReleaseFromGitHub('https://api.github.com', $this->httpDownloader);
     }
 
-    public function testDownloadContent(): void
+    #[DataProvider('validBranchProvider')]
+    public function testTrunkBranchWithValidBranch(string $branchName): void
     {
-        $url            = self::TEST_GITHUB_URL . '/path/to/pie.phar';
-        $pharContent    = uniqid('pharContent', true);
-        $expectedDigest = hash('sha256', $pharContent);
+        $response = $this->createMock(Response::class);
+        $response->method('decodeJson')->willReturn(['default_branch' => $branchName]);
 
-        $latestRelease = new ReleaseMetadata('1.2.3', $url);
-
-        $httpDownloader = $this->createMock(HttpDownloader::class);
-        $authHelper     = $this->createMock(AuthHelper::class);
-
-        $authHelper
-            ->method('addAuthenticationHeader')
-            ->willReturn(['Authorization: Bearer fake-token']);
-        $httpDownloader->expects(self::once())
+        $this->httpDownloader->expects(self::once())
             ->method('get')
-            ->with(
-                $url,
-                [
-                    'retry-auth-failure' => true,
-                    'http' => [
-                        'method' => 'GET',
-                        'header' => ['Authorization: Bearer fake-token'],
-                    ],
-                ],
-            )
-            ->willReturn(
-                new Response(
-                    ['url' => $url],
-                    200,
-                    [],
-                    $pharContent,
-                ),
-            );
+            ->with('https://api.github.com/repos/php/pie')
+            ->willReturn($response);
 
-        $fetch = new FetchPieReleaseFromGitHub(self::TEST_GITHUB_URL, $httpDownloader, $authHelper);
+        self::assertSame($branchName, $this->fetcher->trunkBranch());
+    }
 
-        $file = $fetch->downloadContent($latestRelease);
+    /** @return array<string, array{0: string}> */
+    public static function validBranchProvider(): array
+    {
+        return [
+            '1.4.x' => ['1.4.x'],
+            '1.5.x' => ['1.5.x'],
+            '2.0.x' => ['2.0.x'],
+            '10.11.x' => ['10.11.x'],
+        ];
+    }
 
-        self::assertSame($pharContent, file_get_contents($file->filePath));
-        self::assertSame($expectedDigest, $file->checksum);
+    /** @param class-string<Throwable> $expectedException */
+    #[DataProvider('invalidBranchProvider')]
+    public function testTrunkBranchWithInvalidBranch(string $branchName, string $expectedException = RuntimeException::class): void
+    {
+        $response = $this->createMock(Response::class);
+        $response->method('decodeJson')->willReturn(['default_branch' => $branchName]);
+
+        $this->httpDownloader->expects(self::once())
+            ->method('get')
+            ->with('https://api.github.com/repos/php/pie')
+            ->willReturn($response);
+
+        $this->expectException($expectedException);
+        if ($expectedException === RuntimeException::class) {
+            $this->expectExceptionMessage(sprintf('The default branch "%s" returned by GitHub is not in an expected format.', $branchName));
+        }
+
+        $this->fetcher->trunkBranch();
+    }
+
+    /** @return array<string, array{0: string, 1?: class-string<Throwable>}> */
+    public static function invalidBranchProvider(): array
+    {
+        return [
+            'main'            => ['main'],
+            'feature'         => ['feature/security-fix'],
+            'version-prefix'  => ['v1.5.x'],
+            'no-x-suffix'     => ['1.5.0'],
+            'too-many-dots'   => ['1.5.x.y'],
+            'empty'           => ['', InvalidArgumentException::class],
+            'arbitrary'       => ['some-malicious-branch'],
+            'almost-main'     => ['main-fix'],
+        ];
     }
 }

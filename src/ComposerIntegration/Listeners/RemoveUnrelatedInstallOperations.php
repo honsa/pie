@@ -9,11 +9,12 @@ use Composer\Composer;
 use Composer\DependencyResolver\Operation\InstallOperation;
 use Composer\DependencyResolver\Operation\OperationInterface;
 use Composer\DependencyResolver\Operation\UninstallOperation;
+use Composer\DependencyResolver\Operation\UpdateOperation;
 use Composer\DependencyResolver\Transaction;
 use Composer\Installer\InstallerEvent;
 use Composer\Installer\InstallerEvents;
+use Composer\IO\IOInterface;
 use Php\Pie\ComposerIntegration\PieComposerRequest;
-use Symfony\Component\Console\Output\OutputInterface;
 
 use function array_filter;
 use function assert;
@@ -39,10 +40,6 @@ class RemoveUnrelatedInstallOperations
             );
     }
 
-    /**
-     * @psalm-suppress InternalProperty
-     * @psalm-suppress InternalMethod
-     */
     public function __invoke(InstallerEvent $installerEvent): void
     {
         $pieOutput = $this->composerRequest->pieOutput;
@@ -50,27 +47,29 @@ class RemoveUnrelatedInstallOperations
         $newOperations = array_filter(
             $installerEvent->getTransaction()?->getOperations() ?? [],
             function (OperationInterface $operation) use ($pieOutput): bool {
-                if (! $operation instanceof InstallOperation && ! $operation instanceof UninstallOperation) {
-                    $pieOutput->writeln(
+                if (! $operation instanceof InstallOperation && ! $operation instanceof UninstallOperation && ! $operation instanceof UpdateOperation) {
+                    $pieOutput->writeError(
                         sprintf(
                             'Unexpected operation during installer: %s',
                             $operation::class,
                         ),
-                        OutputInterface::VERBOSITY_VERY_VERBOSE,
+                        verbosity: IOInterface::VERY_VERBOSE,
                     );
 
                     return false;
                 }
 
-                $isRequestedPiePackage = $this->composerRequest->requestedPackage->package === $operation->getPackage()->getName();
+                $operationPackageName = $operation instanceof UpdateOperation ? $operation->getTargetPackage()->getName() : $operation->getPackage()->getName();
+
+                $isRequestedPiePackage = $this->composerRequest->isFor($operationPackageName);
 
                 if (! $isRequestedPiePackage) {
-                    $pieOutput->writeln(
+                    $pieOutput->writeError(
                         sprintf(
                             'Filtering package %s from install operations, as it was not the requested package',
-                            $operation->getPackage()->getName(),
+                            $operationPackageName,
                         ),
-                        OutputInterface::VERBOSITY_VERY_VERBOSE,
+                        verbosity: IOInterface::VERY_VERBOSE,
                     );
                 }
 
@@ -80,7 +79,6 @@ class RemoveUnrelatedInstallOperations
 
         $overrideOperations = Closure::Bind(
             static function (Transaction $transaction) use ($newOperations): void {
-                /** @psalm-suppress InaccessibleProperty */
                 $transaction->operations = $newOperations;
             },
             null,

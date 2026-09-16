@@ -5,7 +5,6 @@ declare(strict_types=1);
 namespace Php\Pie\Downloading;
 
 use Composer\Downloader\TransportException;
-use Composer\Util\AuthHelper;
 use Composer\Util\HttpDownloader;
 use Php\Pie\DependencyResolver\Package;
 use Php\Pie\Platform\TargetPlatform;
@@ -18,45 +17,44 @@ use function strtolower;
 /** @internal This is not public API for PIE, so should not be depended upon unless you accept the risk of BC breaks */
 final class GithubPackageReleaseAssets implements PackageReleaseAssets
 {
-    /** @psalm-api */
     public function __construct(
         private readonly string $githubApiBaseUrl,
     ) {
     }
 
-    /**
-     * @param non-empty-list<non-empty-string> $possibleReleaseAssetNames
-     *
-     * @return non-empty-string
-     */
-    public function findMatchingReleaseAssetUrl(
+    /** @param non-empty-list<non-empty-string> $possibleReleaseAssetNames */
+    public function findMatchingReleaseAsset(
         TargetPlatform $targetPlatform,
         Package $package,
-        AuthHelper $authHelper,
         HttpDownloader $httpDownloader,
+        DownloadUrlMethod $downloadUrlMethod,
         array $possibleReleaseAssetNames,
-    ): string {
+    ): MatchedReleaseAsset {
         $releaseAsset = $this->selectMatchingReleaseAsset(
+            $targetPlatform,
             $package,
-            $this->getReleaseAssetsForPackage($package, $authHelper, $httpDownloader),
+            $this->getReleaseAssetsForPackage($package, $httpDownloader, $downloadUrlMethod),
+            $downloadUrlMethod,
             $possibleReleaseAssetNames,
         );
 
-        return $releaseAsset['browser_download_url'];
+        return new MatchedReleaseAsset($releaseAsset['url'], $releaseAsset['name']);
     }
 
     /** @link https://github.com/squizlabs/PHP_CodeSniffer/issues/3734 */
     // phpcs:disable Squiz.Commenting.FunctionComment.MissingParamName
     /**
-     * @param list<array{name: non-empty-string, browser_download_url: non-empty-string, ...}> $releaseAssets
+     * @param list<array{name: non-empty-string, url: non-empty-string, ...}> $releaseAssets
      * @param non-empty-list<non-empty-string> $possibleReleaseAssetNames
      *
-     * @return array{name: non-empty-string, browser_download_url: non-empty-string, ...}
+     * @return array{name: non-empty-string, url: non-empty-string, ...}
      */
     // phpcs:enable
     private function selectMatchingReleaseAsset(
+        TargetPlatform $targetPlatform,
         Package $package,
         array $releaseAssets,
+        DownloadUrlMethod $downloadUrlMethod,
         array $possibleReleaseAssetNames,
     ): array {
         foreach ($releaseAssets as $releaseAsset) {
@@ -65,51 +63,51 @@ final class GithubPackageReleaseAssets implements PackageReleaseAssets
             }
         }
 
-        throw Exception\CouldNotFindReleaseAsset::forPackage($package, $possibleReleaseAssetNames);
+        throw Exception\CouldNotFindReleaseAsset::forPackage($targetPlatform, $package, $downloadUrlMethod, $possibleReleaseAssetNames);
     }
 
-    /** @return list<array{name: non-empty-string, browser_download_url: non-empty-string, ...}> */
+    /** @return list<array{name: non-empty-string, url: non-empty-string, ...}> */
     private function getReleaseAssetsForPackage(
         Package $package,
-        AuthHelper $authHelper,
         HttpDownloader $httpDownloader,
+        DownloadUrlMethod $downloadUrlMethod,
     ): array {
         Assert::notNull($package->downloadUrl());
 
         try {
-            $decodedRepsonse = $httpDownloader->get(
+            $decodedResponse = $httpDownloader->get(
                 $this->githubApiBaseUrl . '/repos/' . $package->githubOrgAndRepository() . '/releases/tags/' . $package->version(),
                 [
                     'retry-auth-failure' => true,
                     'http' => [
                         'method' => 'GET',
-                        'header' => $authHelper->addAuthenticationHeader([], $this->githubApiBaseUrl, $package->downloadUrl()),
+                        'header' => [],
                     ],
                 ],
             )->decodeJson();
         } catch (TransportException $t) {
             /** @link https://docs.github.com/en/rest/releases/releases?apiVersion=2022-11-28#get-a-release-by-tag-name */
             if ($t->getStatusCode() === 404) {
-                throw Exception\CouldNotFindReleaseAsset::forPackageWithMissingTag($package);
+                throw Exception\CouldNotFindReleaseAsset::forPackageWithMissingTag($package, $downloadUrlMethod);
             }
 
             throw $t;
         }
 
-        Assert::isArray($decodedRepsonse);
-        Assert::keyExists($decodedRepsonse, 'assets');
-        Assert::isList($decodedRepsonse['assets']);
+        Assert::isArray($decodedResponse);
+        Assert::keyExists($decodedResponse, 'assets');
+        Assert::isList($decodedResponse['assets']);
 
         return array_map(
             static function (array $asset): array {
                 Assert::keyExists($asset, 'name');
                 Assert::stringNotEmpty($asset['name']);
-                Assert::keyExists($asset, 'browser_download_url');
-                Assert::stringNotEmpty($asset['browser_download_url']);
+                Assert::keyExists($asset, 'url');
+                Assert::stringNotEmpty($asset['url']);
 
                 return $asset;
             },
-            $decodedRepsonse['assets'],
+            $decodedResponse['assets'],
         );
     }
 }

@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace Php\Pie\Command;
 
+use Composer\IO\IOInterface;
+use Composer\IO\NullIO;
 use Php\Pie\ComposerIntegration\PieComposerFactory;
 use Php\Pie\ComposerIntegration\PieComposerRequest;
 use Psr\Container\ContainerInterface;
@@ -20,6 +22,7 @@ final class RepositoryListCommand extends Command
 {
     public function __construct(
         private readonly ContainerInterface $container,
+        private readonly IOInterface $io,
     ) {
         parent::__construct();
     }
@@ -33,15 +36,17 @@ final class RepositoryListCommand extends Command
 
     public function execute(InputInterface $input, OutputInterface $output): int
     {
+        CommandHelper::applyNoCacheOptionIfSet($input, $this->io);
+
         CommandHelper::listRepositories(
             PieComposerFactory::createPieComposer(
                 $this->container,
                 PieComposerRequest::noOperation(
-                    $output,
-                    CommandHelper::determineTargetPlatformFromInputs($input, $output),
+                    new NullIO(),
+                    CommandHelper::determineTargetPlatformFromInputs($input, $this->io),
                 ),
             ),
-            $output,
+            $this->io,
         );
 
         return 0;

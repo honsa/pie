@@ -4,7 +4,8 @@ declare(strict_types=1);
 
 namespace Php\PieUnitTest\Installing\Ini;
 
-use Composer\Package\CompletePackage;
+use Composer\IO\BufferIO;
+use Composer\Package\CompletePackageInterface;
 use Php\Pie\DependencyResolver\Package;
 use Php\Pie\ExtensionName;
 use Php\Pie\ExtensionType;
@@ -17,30 +18,30 @@ use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\RequiresOperatingSystemFamily;
 use PHPUnit\Framework\MockObject\MockObject;
 use PHPUnit\Framework\TestCase;
-use Symfony\Component\Console\Output\BufferedOutput;
+use Symfony\Component\Console\Output\OutputInterface;
 
-use function chmod;
-use function file_get_contents;
-use function file_put_contents;
+use function Safe\chmod;
+use function Safe\file_get_contents;
+use function Safe\file_put_contents;
+use function Safe\tempnam;
+use function Safe\touch;
+use function Safe\unlink;
 use function sprintf;
 use function sys_get_temp_dir;
-use function tempnam;
-use function touch;
-use function unlink;
 
 use const PHP_EOL;
 
 #[CoversClass(AddExtensionToTheIniFile::class)]
 final class AddExtensionToTheIniFileTest extends TestCase
 {
-    private BufferedOutput $output;
+    private BufferIO $io;
     private PhpBinaryPath&MockObject $mockPhpBinary;
 
     public function setUp(): void
     {
         parent::setUp();
 
-        $this->output        = new BufferedOutput(BufferedOutput::VERBOSITY_VERBOSE);
+        $this->io            = new BufferIO(verbosity: OutputInterface::VERBOSITY_VERBOSE);
         $this->mockPhpBinary = $this->createMock(PhpBinaryPath::class);
     }
 
@@ -58,7 +59,7 @@ final class AddExtensionToTheIniFileTest extends TestCase
             self::assertFalse((new AddExtensionToTheIniFile())(
                 $unwritableFilename,
                 new Package(
-                    $this->createMock(CompletePackage::class),
+                    $this->createMock(CompletePackageInterface::class),
                     ExtensionType::PhpModule,
                     ExtensionName::normaliseFromString('foobar'),
                     'foo/bar',
@@ -66,13 +67,13 @@ final class AddExtensionToTheIniFileTest extends TestCase
                     null,
                 ),
                 $this->mockPhpBinary,
-                $this->output,
+                $this->io,
                 null,
             ));
 
             self::assertStringContainsString(
                 sprintf('PHP is configured to use %s, but it is not writable by PIE.', $unwritableFilename),
-                $this->output->fetch(),
+                $this->io->getOutput(),
             );
         } finally {
             chmod($unwritableFilename, 644);
@@ -94,7 +95,7 @@ final class AddExtensionToTheIniFileTest extends TestCase
             self::assertTrue((new AddExtensionToTheIniFile())(
                 $unwritableFilename,
                 new Package(
-                    $this->createMock(CompletePackage::class),
+                    $this->createMock(CompletePackageInterface::class),
                     ExtensionType::PhpModule,
                     ExtensionName::normaliseFromString('foobar'),
                     'foo/bar',
@@ -102,7 +103,7 @@ final class AddExtensionToTheIniFileTest extends TestCase
                     null,
                 ),
                 $this->mockPhpBinary,
-                $this->output,
+                $this->io,
                 null,
             ));
         } finally {
@@ -126,7 +127,7 @@ final class AddExtensionToTheIniFileTest extends TestCase
             self::assertFalse((new AddExtensionToTheIniFile())(
                 $unreadableIniFile,
                 new Package(
-                    $this->createMock(CompletePackage::class),
+                    $this->createMock(CompletePackageInterface::class),
                     ExtensionType::PhpModule,
                     ExtensionName::normaliseFromString('foobar'),
                     'foo/bar',
@@ -134,13 +135,13 @@ final class AddExtensionToTheIniFileTest extends TestCase
                     null,
                 ),
                 $this->mockPhpBinary,
-                $this->output,
+                $this->io,
                 null,
             ));
 
             self::assertStringContainsString(
                 sprintf('Could not read %s to make a backup of it, aborting enablement of extension', $unreadableIniFile),
-                $this->output->fetch(),
+                $this->io->getOutput(),
             );
         } finally {
             chmod($unreadableIniFile, 644);
@@ -156,10 +157,6 @@ final class AddExtensionToTheIniFileTest extends TestCase
         $iniFile = tempnam(sys_get_temp_dir(), 'PIE_ini_file');
         file_put_contents($iniFile, $originalIniContent);
 
-        /**
-         * @psalm-suppress PossiblyNullFunctionCall
-         * @psalm-suppress UndefinedThisPropertyAssignment
-         */
         (fn () => $this->phpBinaryPath = '/path/to/php')
             ->bindTo($this->mockPhpBinary, PhpBinaryPath::class)();
         $this->mockPhpBinary
@@ -173,7 +170,7 @@ final class AddExtensionToTheIniFileTest extends TestCase
             self::assertFalse((new AddExtensionToTheIniFile())(
                 $iniFile,
                 new Package(
-                    $this->createMock(CompletePackage::class),
+                    $this->createMock(CompletePackageInterface::class),
                     ExtensionType::PhpModule,
                     $extensionName,
                     'foo/bar',
@@ -181,13 +178,13 @@ final class AddExtensionToTheIniFileTest extends TestCase
                     null,
                 ),
                 $this->mockPhpBinary,
-                $this->output,
+                $this->io,
                 null,
             ));
 
             self::assertStringContainsString(
                 'Something went wrong enabling the foobar extension: Expected extension foobar to be loaded in PHP /path/to/php, but it was not detected.',
-                $this->output->fetch(),
+                $this->io->getOutput(),
             );
 
             // Ensure the original INI file content was restored
@@ -210,7 +207,7 @@ final class AddExtensionToTheIniFileTest extends TestCase
             self::assertTrue((new AddExtensionToTheIniFile())(
                 $iniFile,
                 new Package(
-                    $this->createMock(CompletePackage::class),
+                    $this->createMock(CompletePackageInterface::class),
                     ExtensionType::PhpModule,
                     ExtensionName::normaliseFromString('foobar'),
                     'foo/bar',
@@ -218,7 +215,7 @@ final class AddExtensionToTheIniFileTest extends TestCase
                     null,
                 ),
                 $this->mockPhpBinary,
-                $this->output,
+                $this->io,
                 null,
             ));
 
@@ -232,7 +229,7 @@ final class AddExtensionToTheIniFileTest extends TestCase
 
             self::assertStringContainsString(
                 sprintf('Enabled extension foobar in the INI file %s', $iniFile),
-                $this->output->fetch(),
+                $this->io->getOutput(),
             );
         } finally {
             unlink($iniFile);
@@ -253,7 +250,7 @@ final class AddExtensionToTheIniFileTest extends TestCase
             self::assertTrue((new AddExtensionToTheIniFile())(
                 $iniFile,
                 new Package(
-                    $this->createMock(CompletePackage::class),
+                    $this->createMock(CompletePackageInterface::class),
                     ExtensionType::PhpModule,
                     ExtensionName::normaliseFromString('foobar'),
                     'foo/bar',
@@ -261,7 +258,7 @@ final class AddExtensionToTheIniFileTest extends TestCase
                     null,
                 ),
                 $this->mockPhpBinary,
-                $this->output,
+                $this->io,
                 static function () use (&$additionalStepInvoked): bool {
                     $additionalStepInvoked = true;
 
@@ -281,7 +278,7 @@ final class AddExtensionToTheIniFileTest extends TestCase
 
             self::assertStringContainsString(
                 sprintf('Enabled extension foobar in the INI file %s', $iniFile),
-                $this->output->fetch(),
+                $this->io->getOutput(),
             );
         } finally {
             unlink($iniFile);

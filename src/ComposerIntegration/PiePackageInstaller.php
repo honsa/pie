@@ -6,14 +6,16 @@ namespace Php\Pie\ComposerIntegration;
 
 use Composer\Installer\LibraryInstaller;
 use Composer\IO\IOInterface;
-use Composer\Package\CompletePackage;
+use Composer\Package\CompletePackageInterface;
 use Composer\Package\PackageInterface;
 use Composer\PartialComposer;
 use Composer\Repository\InstalledRepositoryInterface;
 use Composer\Util\Filesystem;
+use Php\Pie\DependencyResolver\RequestedPackageAndVersion;
 use Php\Pie\ExtensionType;
-use Symfony\Component\Console\Output\OutputInterface;
 
+use function array_map;
+use function implode;
 use function sprintf;
 
 /** @internal This is not public API for PIE, so should not be depended upon unless you accept the risk of BC breaks */
@@ -37,40 +39,38 @@ class PiePackageInstaller extends LibraryInstaller
         $composerPackage = $package;
 
         return parent::install($repo, $composerPackage)
-            ?->then(function () use ($composerPackage) {
-                $output = $this->composerRequest->pieOutput;
-
-                if ($this->composerRequest->requestedPackage->package !== $composerPackage->getName()) {
-                    $output->writeln(
-                        sprintf(
-                            '<comment>Skipping %s install request from Composer as it was not the expected PIE package %s</comment>',
-                            $composerPackage->getName(),
-                            $this->composerRequest->requestedPackage->package,
-                        ),
-                        OutputInterface::VERBOSITY_VERY_VERBOSE,
+            ?->then($this->onlyForRequestedPiePackage(
+                $composerPackage,
+                'install',
+                function (CompletePackageInterface $composerPackage): void {
+                    ($this->installAndBuildProcess)(
+                        $this->composer,
+                        $this->composerRequest,
+                        $composerPackage,
+                        $this->getInstallPath($composerPackage),
                     );
+                },
+            ));
+    }
 
-                    return null;
-                }
+    /** @inheritDoc */
+    public function update(InstalledRepositoryInterface $repo, PackageInterface $initial, PackageInterface $target)
+    {
+        $composerPackage = $target;
 
-                if (! $composerPackage instanceof CompletePackage) {
-                    $output->writeln(sprintf(
-                        '<error>Not using PIE to install %s as it was not a Complete Package</error>',
-                        $composerPackage->getName(),
-                    ));
-
-                    return null;
-                }
-
-                ($this->installAndBuildProcess)(
-                    $this->composer,
-                    $this->composerRequest,
-                    $composerPackage,
-                    $this->getInstallPath($composerPackage),
-                );
-
-                return null;
-            });
+        return parent::update($repo, $initial, $target)
+            ?->then($this->onlyForRequestedPiePackage(
+                $composerPackage,
+                'update',
+                function (CompletePackageInterface $composerPackage): void {
+                    ($this->installAndBuildProcess)(
+                        $this->composer,
+                        $this->composerRequest,
+                        $composerPackage,
+                        $this->getInstallPath($composerPackage),
+                    );
+                },
+            ));
     }
 
     /** @inheritDoc */
@@ -79,37 +79,56 @@ class PiePackageInstaller extends LibraryInstaller
         $composerPackage = $package;
 
         return parent::uninstall($repo, $composerPackage)
-            ?->then(function () use ($composerPackage) {
-                $output = $this->composerRequest->pieOutput;
-
-                if ($this->composerRequest->requestedPackage->package !== $composerPackage->getName()) {
-                    $output->writeln(
-                        sprintf(
-                            '<comment>Skipping %s uninstall request from Composer as it was not the expected PIE package %s</comment>',
-                            $composerPackage->getName(),
-                            $this->composerRequest->requestedPackage->package,
-                        ),
-                        OutputInterface::VERBOSITY_VERY_VERBOSE,
+            ?->then($this->onlyForRequestedPiePackage(
+                $composerPackage,
+                'uninstall',
+                function (CompletePackageInterface $composerPackage): void {
+                    ($this->uninstallProcess)(
+                        $this->composerRequest,
+                        $composerPackage,
                     );
+                },
+            ));
+    }
 
-                    return null;
-                }
+    /**
+     * Wraps the given callback so it only runs when Composer's operation is for a PIE package we actually
+     * requested, and that package has full metadata available.
+     *
+     * @return callable(): null
+     */
+    private function onlyForRequestedPiePackage(PackageInterface $composerPackage, string $verb, callable $onVerified): callable
+    {
+        return function () use ($composerPackage, $verb, $onVerified) {
+            $io = $this->composerRequest->pieOutput;
 
-                if (! $composerPackage instanceof CompletePackage) {
-                    $output->writeln(sprintf(
-                        '<error>Not using PIE to install %s as it was not a Complete Package</error>',
+            if (! $this->composerRequest->isFor($composerPackage->getName())) {
+                $io->write(
+                    sprintf(
+                        '<comment>Skipping %s %s request from Composer as it was not the expected PIE package(s) %s</comment>',
                         $composerPackage->getName(),
-                    ));
-
-                    return null;
-                }
-
-                ($this->uninstallProcess)(
-                    $this->composerRequest,
-                    $composerPackage,
+                        $verb,
+                        implode(', ', array_map(static fn (RequestedPackageAndVersion $req) => $req->package, $this->composerRequest->requestedPackages)),
+                    ),
+                    verbosity: IOInterface::VERY_VERBOSE,
                 );
 
                 return null;
-            });
+            }
+
+            if (! $composerPackage instanceof CompletePackageInterface) {
+                $io->writeError(sprintf(
+                    '<error>Not using PIE to %s %s as it was not a Complete Package</error>',
+                    $verb,
+                    $composerPackage->getName(),
+                ));
+
+                return null;
+            }
+
+            $onVerified($composerPackage);
+
+            return null;
+        };
     }
 }

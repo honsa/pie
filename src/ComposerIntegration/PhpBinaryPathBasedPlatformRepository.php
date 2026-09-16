@@ -6,14 +6,19 @@ namespace Php\Pie\ComposerIntegration;
 
 use Composer\Composer;
 use Composer\Package\CompletePackage;
+use Composer\Package\CompletePackageInterface;
 use Composer\Pcre\Preg;
 use Composer\Repository\PlatformRepository;
 use Composer\Semver\VersionParser;
 use Php\Pie\ExtensionName;
 use Php\Pie\Platform\InstalledPiePackages;
 use Php\Pie\Platform\TargetPhp\PhpBinaryPath;
+use Php\Pie\Util\Process;
+use Symfony\Component\Process\Exception\ProcessFailedException;
 use UnexpectedValueException;
 
+use function array_map;
+use function explode;
 use function in_array;
 use function str_replace;
 use function str_starts_with;
@@ -26,7 +31,8 @@ class PhpBinaryPathBasedPlatformRepository extends PlatformRepository
 {
     private VersionParser $versionParser;
 
-    public function __construct(PhpBinaryPath $phpBinaryPath, Composer $composer, InstalledPiePackages $installedPiePackages, ExtensionName|null $extensionBeingInstalled)
+    /** @param list<ExtensionName> $extensionsBeingInstalled */
+    public function __construct(PhpBinaryPath $phpBinaryPath, Composer $composer, InstalledPiePackages $installedPiePackages, array $extensionsBeingInstalled)
     {
         $this->versionParser = new VersionParser();
         $this->packages      = [];
@@ -40,7 +46,7 @@ class PhpBinaryPathBasedPlatformRepository extends PlatformRepository
 
         $piePackages                          = $installedPiePackages->allPiePackages($composer);
         $extensionsBeingReplacedByPiePackages = [];
-        foreach ($piePackages as $piePackage) {
+        foreach ($piePackages->packages() as $piePackage) {
             foreach ($piePackage->composerPackage()->getReplaces() as $replaceLink) {
                 $target = $replaceLink->getTarget();
                 if (
@@ -54,6 +60,8 @@ class PhpBinaryPathBasedPlatformRepository extends PlatformRepository
             }
         }
 
+        $extensionNamesBeingInstalled = array_map(static fn (ExtensionName $ext) => $ext->name(), $extensionsBeingInstalled);
+
         foreach ($extVersions as $extension => $extensionVersion) {
             /**
              * If the extension we're trying to exclude is not excluded from this list if it is already installed
@@ -61,7 +69,7 @@ class PhpBinaryPathBasedPlatformRepository extends PlatformRepository
              *
              * @link https://github.com/php/pie/issues/150
              */
-            if ($extensionBeingInstalled !== null && $extension === $extensionBeingInstalled->name()) {
+            if (in_array($extension, $extensionNamesBeingInstalled, true)) {
                 continue;
             }
 
@@ -77,10 +85,12 @@ class PhpBinaryPathBasedPlatformRepository extends PlatformRepository
             $this->addPackage($this->packageForExtension($extension, $extensionVersion));
         }
 
+        $this->addLibrariesUsingPkgConfig();
+
         parent::__construct();
     }
 
-    private function packageForExtension(string $name, string $prettyVersion): CompletePackage
+    private function packageForExtension(string $name, string $prettyVersion): CompletePackageInterface
     {
         $extraDescription = '';
 
@@ -106,5 +116,72 @@ class PhpBinaryPathBasedPlatformRepository extends PlatformRepository
         $package->setType('php-ext');
 
         return $package;
+    }
+
+    /**
+     * The `$alias` parameter is the name of the dependency in `composer.json`,
+     * but without the `lib-` prefix; e.g. `curl` would be `lib-curl` in the
+     * `composer.json`.
+     *
+     * The `$library` parameter should be the name of the library to look up
+     * using `pkg-config`.
+     */
+    private function detectLibraryWithPkgConfig(string $alias, string $library): void
+    {
+        try {
+            $pkgConfigResult = Process::run(['pkg-config', '--print-provides', '--print-errors', $library]);
+        } catch (ProcessFailedException) {
+            return;
+        }
+
+        [$library, $prettyVersion] = explode('=', $pkgConfigResult);
+        if (! $library || ! $prettyVersion) {
+            return;
+        }
+
+        try {
+            $version = $this->versionParser->normalize($prettyVersion);
+        } catch (UnexpectedValueException) {
+            $version = '*'; // @todo check this is the best way to handle unparsed versions?
+        }
+
+        $lib = new CompletePackage('lib-' . $alias, $version, $prettyVersion);
+        $lib->setDescription('The ' . $alias . ' library, ' . $library);
+        $this->addPackage($lib);
+    }
+
+    /**
+     * Instructions for PIE to install these libraries, if they are missing, should be added
+     * into {@see \Php\Pie\DependencyResolver\DependencyInstaller\SystemDependenciesDefinition::default()}
+     */
+    private function addLibrariesUsingPkgConfig(): void
+    {
+        $this->detectLibraryWithPkgConfig('curl', 'libcurl');
+        $this->detectLibraryWithPkgConfig('enchant', 'enchant');
+        $this->detectLibraryWithPkgConfig('enchant-2', 'enchant-2');
+        $this->detectLibraryWithPkgConfig('sodium', 'libsodium');
+        $this->detectLibraryWithPkgConfig('ffi', 'libffi');
+        $this->detectLibraryWithPkgConfig('xslt', 'libxslt');
+        $this->detectLibraryWithPkgConfig('zip', 'libzip');
+        $this->detectLibraryWithPkgConfig('png', 'libpng');
+        $this->detectLibraryWithPkgConfig('avif', 'libavif');
+        $this->detectLibraryWithPkgConfig('webp', 'libwebp');
+        $this->detectLibraryWithPkgConfig('jpeg', 'libjpeg');
+        $this->detectLibraryWithPkgConfig('xpm', 'xpm');
+        $this->detectLibraryWithPkgConfig('freetype2', 'freetype2');
+        $this->detectLibraryWithPkgConfig('gdlib', 'gdlib');
+        $this->detectLibraryWithPkgConfig('gmp', 'gmp');
+        $this->detectLibraryWithPkgConfig('gpgme', 'gpgme');
+        $this->detectLibraryWithPkgConfig('pam', 'pam');
+        $this->detectLibraryWithPkgConfig('sasl', 'libsasl2');
+        $this->detectLibraryWithPkgConfig('onig', 'oniguruma');
+        $this->detectLibraryWithPkgConfig('odbc', 'libiodbc');
+        $this->detectLibraryWithPkgConfig('capstone', 'capstone');
+        $this->detectLibraryWithPkgConfig('pcre', 'libpcre2-8');
+        $this->detectLibraryWithPkgConfig('edit', 'libedit');
+        $this->detectLibraryWithPkgConfig('snmp', 'netsnmp');
+        $this->detectLibraryWithPkgConfig('argon2', 'libargon2');
+        $this->detectLibraryWithPkgConfig('uriparser', 'liburiparser');
+        $this->detectLibraryWithPkgConfig('exslt', 'libexslt');
     }
 }

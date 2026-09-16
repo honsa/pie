@@ -4,7 +4,7 @@ declare(strict_types=1);
 
 namespace Php\PieUnitTest\Platform;
 
-use Composer\Package\CompletePackage;
+use Composer\Package\CompletePackageInterface;
 use Php\Pie\DependencyResolver\Package;
 use Php\Pie\ExtensionName;
 use Php\Pie\ExtensionType;
@@ -38,12 +38,13 @@ final class WindowsExtensionAssetNameTest extends TestCase
             ThreadSafetyMode::ThreadSafe,
             1,
             WindowsCompiler::VC14,
+            null,
         );
 
         $this->phpVersion = $this->platform->phpBinaryPath->majorMinorVersion();
 
         $this->package = new Package(
-            $this->createMock(CompletePackage::class),
+            $this->createMock(CompletePackageInterface::class),
             ExtensionType::PhpModule,
             ExtensionName::normaliseFromString('foo'),
             'phpf/foo',

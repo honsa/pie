@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Php\PieUnitTest\Installing\Ini;
 
+use Composer\IO\IOInterface;
 use Composer\Package\CompletePackageInterface;
 use Composer\Util\Filesystem;
 use Php\Pie\DependencyResolver\Package;
@@ -20,19 +21,18 @@ use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\RequiresOperatingSystemFamily;
 use PHPUnit\Framework\TestCase;
-use Symfony\Component\Console\Output\OutputInterface;
 use Webmozart\Assert\Assert;
 
-use function file_get_contents;
-use function file_put_contents;
 use function is_link;
-use function mkdir;
-use function realpath;
-use function symlink;
+use function Safe\file_get_contents;
+use function Safe\file_put_contents;
+use function Safe\mkdir;
+use function Safe\realpath;
+use function Safe\symlink;
+use function Safe\tempnam;
+use function Safe\unlink;
 use function sys_get_temp_dir;
-use function tempnam;
 use function uniqid;
-use function unlink;
 
 use const DIRECTORY_SEPARATOR;
 
@@ -104,12 +104,13 @@ final class RemoveIniEntryWithFileGetContentsTest extends TestCase
             ThreadSafetyMode::ThreadSafe,
             1,
             null,
+            null,
         );
 
         $affectedFiles = (new RemoveIniEntryWithFileGetContents())(
             $package,
             $targetPlatform,
-            $this->createMock(OutputInterface::class),
+            $this->createMock(IOInterface::class),
         );
 
         self::assertSame(
@@ -125,6 +126,47 @@ final class RemoveIniEntryWithFileGetContentsTest extends TestCase
         self::assertSame(
             $expectedActiveContent,
             file_get_contents($this->iniFilePath . DIRECTORY_SEPARATOR . 'with_active_exts.ini'),
+        );
+    }
+
+    #[DataProvider('extensionTypeProvider')]
+    public function testNonExistentAdditionalIniDirectoryDoesNotCrash(ExtensionType $extensionType): void
+    {
+        $phpBinaryPath = $this->createMock(PhpBinaryPath::class);
+        $phpBinaryPath
+            ->method('loadedIniConfigurationFile')
+            ->willReturn(null);
+        $phpBinaryPath
+            ->method('additionalIniDirectory')
+            ->willReturn('/this/path/should/not/exist/for/testing');
+
+        $package = new Package(
+            $this->createMock(CompletePackageInterface::class),
+            $extensionType,
+            ExtensionName::normaliseFromString('foobar'),
+            'foobar/foobar',
+            '1.2.3',
+            null,
+        );
+
+        $targetPlatform = new TargetPlatform(
+            OperatingSystem::NonWindows,
+            OperatingSystemFamily::Linux,
+            $phpBinaryPath,
+            Architecture::x86_64,
+            ThreadSafetyMode::ThreadSafe,
+            1,
+            null,
+            null,
+        );
+
+        self::assertSame(
+            [],
+            (new RemoveIniEntryWithFileGetContents())(
+                $package,
+                $targetPlatform,
+                $this->createMock(IOInterface::class),
+            ),
         );
     }
 
@@ -162,12 +204,13 @@ final class RemoveIniEntryWithFileGetContentsTest extends TestCase
             ThreadSafetyMode::ThreadSafe,
             1,
             null,
+            null,
         );
 
         $affectedFiles = (new RemoveIniEntryWithFileGetContents())(
             $package,
             $targetPlatform,
-            $this->createMock(OutputInterface::class),
+            $this->createMock(IOInterface::class),
         );
 
         self::assertSame(

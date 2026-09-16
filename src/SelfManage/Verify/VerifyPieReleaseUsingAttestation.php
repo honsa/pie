@@ -4,11 +4,12 @@ declare(strict_types=1);
 
 namespace Php\Pie\SelfManage\Verify;
 
-use Composer\Util\AuthHelper;
-use Composer\Util\HttpDownloader;
+use Composer\Config;
+use Composer\IO\IOInterface;
+use Php\Pie\ComposerIntegration\QuieterConsoleIO;
 use Php\Pie\File\BinaryFile;
+use Php\Pie\SelfManage\Update\FetchPieRelease;
 use Php\Pie\SelfManage\Update\ReleaseMetadata;
-use Symfony\Component\Console\Output\OutputInterface;
 use Symfony\Component\Process\ExecutableFinder;
 
 use function extension_loaded;
@@ -23,29 +24,26 @@ final class VerifyPieReleaseUsingAttestation implements VerifyPiePhar
     }
 
     /** @param non-empty-string $githubApiBaseUrl */
-    public static function factory(
-        string $githubApiBaseUrl,
-        HttpDownloader $httpDownloader,
-        AuthHelper $authHelper,
-    ): self {
+    public static function factory(FetchPieRelease $fetchPieRelease, QuieterConsoleIO $io, Config $config, string $githubApiBaseUrl): self
+    {
         return new VerifyPieReleaseUsingAttestation(
-            new GithubCliAttestationVerification(new ExecutableFinder()),
-            new FallbackVerificationUsingOpenSsl(FallbackVerificationUsingOpenSsl::TRUSTED_ROOT_FILE_PATH, $githubApiBaseUrl, $httpDownloader, $authHelper),
+            new GithubCliAttestationVerification(new ExecutableFinder(), $fetchPieRelease),
+            FallbackVerificationUsingOpenSsl::factory($fetchPieRelease, $io, $config, $githubApiBaseUrl),
         );
     }
 
-    public function verify(ReleaseMetadata $releaseMetadata, BinaryFile $pharFilename, OutputInterface $output): void
+    public function verify(ReleaseMetadata $releaseMetadata, BinaryFile $pharFilename, IOInterface $io): void
     {
         try {
-            $this->githubCliVerification->verify($releaseMetadata, $pharFilename, $output);
+            $this->githubCliVerification->verify($releaseMetadata, $pharFilename, $io);
         } catch (GithubCliNotAvailable $githubCliNotAvailable) {
-            $output->writeln($githubCliNotAvailable->getMessage(), OutputInterface::VERBOSITY_VERBOSE);
+            $io->writeError($githubCliNotAvailable->getMessage(), verbosity: IOInterface::VERBOSE);
 
             if (! extension_loaded('openssl')) {
                 throw FailedToVerifyRelease::fromNoOpenssl();
             }
 
-            $this->fallbackVerification->verify($releaseMetadata, $pharFilename, $output);
+            $this->fallbackVerification->verify($releaseMetadata, $pharFilename, $io);
         }
     }
 }

@@ -5,7 +5,9 @@ declare(strict_types=1);
 namespace Php\PieUnitTest\Command;
 
 use Composer\Composer;
-use Composer\Package\CompletePackage;
+use Composer\IO\BufferIO;
+use Composer\IO\NullIO;
+use Composer\Package\CompletePackageInterface;
 use Composer\Repository\ComposerRepository;
 use Composer\Repository\PathRepository;
 use Composer\Repository\RepositoryManager;
@@ -14,24 +16,41 @@ use Composer\Repository\VcsRepository;
 use Composer\Util\Platform;
 use InvalidArgumentException;
 use Php\Pie\Command\CommandHelper;
+use Php\Pie\Command\ConfigureOptionCollision;
+use Php\Pie\DependencyResolver\BundledPhpExtensionRefusal;
+use Php\Pie\DependencyResolver\DependencyResolver;
 use Php\Pie\DependencyResolver\Package;
 use Php\Pie\DependencyResolver\RequestedPackageAndVersion;
+use Php\Pie\DependencyResolver\ResolvedPackageRequest;
+use Php\Pie\DependencyResolver\UnableToResolveRequirement;
+use Php\Pie\Downloading\DownloadUrlMethod;
+use Php\Pie\Platform\Architecture;
+use Php\Pie\Platform\OperatingSystem;
+use Php\Pie\Platform\OperatingSystemFamily;
+use Php\Pie\Platform\TargetPhp\PhpBinaryPath;
+use Php\Pie\Platform\TargetPlatform;
+use Php\Pie\Platform\ThreadSafetyMode;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\RequiresOperatingSystemFamily;
 use PHPUnit\Framework\TestCase;
+use RuntimeException;
 use Symfony\Component\Console\Command\Command;
 use Symfony\Component\Console\Input\ArrayInput;
 use Symfony\Component\Console\Input\InputDefinition;
 use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\Console\Input\InputOption;
-use Symfony\Component\Console\Output\BufferedOutput;
-use Symfony\Component\Console\Output\NullOutput;
 
 use function array_combine;
 use function array_map;
+use function Safe\mkdir;
+use function Safe\symlink;
 use function str_replace;
+use function sys_get_temp_dir;
 use function trim;
+use function uniqid;
+
+use const DIRECTORY_SEPARATOR;
 
 #[CoversClass(CommandHelper::class)]
 final class CommandHelperTest extends TestCase
@@ -66,11 +85,38 @@ final class CommandHelperTest extends TestCase
         $input->expects(self::once())
             ->method('getArgument')
             ->with('requested-package-and-version')
-            ->willReturn($requestedPackageAndVersion);
+            ->willReturn([$requestedPackageAndVersion]);
 
         self::assertEquals(
-            new RequestedPackageAndVersion($expectedPackage, $expectedVersion),
-            CommandHelper::requestedNameAndVersionPair($input),
+            [new RequestedPackageAndVersion($expectedPackage, $expectedVersion)],
+            CommandHelper::requestedNameAndVersionPairs($input),
+        );
+    }
+
+    public function testRequestedNameAndVersionPairSupportsMultiple(): void
+    {
+        $input = $this->createMock(InputInterface::class);
+
+        $input->expects(self::once())
+            ->method('getArgument')
+            ->with('requested-package-and-version')
+            ->willReturn([
+                'a/ext',
+                'b/ext:^1.2',
+                'c/ext:*',
+                'd/ext:@alpha',
+                'e/ext:1.2.3',
+            ]);
+
+        self::assertEquals(
+            [
+                new RequestedPackageAndVersion('a/ext', null),
+                new RequestedPackageAndVersion('b/ext', '^1.2'),
+                new RequestedPackageAndVersion('c/ext', '*'),
+                new RequestedPackageAndVersion('d/ext', '@alpha'),
+                new RequestedPackageAndVersion('e/ext', '1.2.3'),
+            ],
+            CommandHelper::requestedNameAndVersionPairs($input),
         );
     }
 
@@ -85,7 +131,7 @@ final class CommandHelperTest extends TestCase
 
         $this->expectException(InvalidArgumentException::class);
         $this->expectExceptionMessage('No package was requested for installation');
-        CommandHelper::requestedNameAndVersionPair($input);
+        CommandHelper::requestedNameAndVersionPairs($input);
     }
 
     public function testBindingConfigurationOptionsFromPackage(): void
@@ -93,9 +139,109 @@ final class CommandHelperTest extends TestCase
         self::markTestIncomplete(__METHOD__);
     }
 
+    private static function packageNamed(string $prettyName, string $prettyVersion): Package
+    {
+        $composerPackage = self::createStub(CompletePackageInterface::class);
+        $composerPackage->method('getPrettyName')->willReturn($prettyName);
+        $composerPackage->method('getPrettyVersion')->willReturn($prettyVersion);
+        $composerPackage->method('getType')->willReturn('php-ext');
+
+        return Package::fromComposerCompletePackage($composerPackage);
+    }
+
+    public function testResolveRequestedPackagesResolvesEachRequestedPackageAndWritesOutput(): void
+    {
+        $requestedA = new RequestedPackageAndVersion('foo/bar', null);
+        $requestedB = new RequestedPackageAndVersion('baz/qux', '^1.0');
+
+        $resolvedA = new ResolvedPackageRequest(self::packageNamed('foo/bar', '1.0.0'), $requestedA);
+        $resolvedB = new ResolvedPackageRequest(self::packageNamed('baz/qux', '2.0.0'), $requestedB);
+
+        $composer       = $this->createMock(Composer::class);
+        $targetPlatform = $this->createMock(TargetPlatform::class);
+
+        $dependencyResolver = $this->createMock(DependencyResolver::class);
+        $dependencyResolver->expects(self::exactly(2))
+            ->method('__invoke')
+            ->willReturnCallback(
+                static function (Composer $givenComposer, TargetPlatform $givenTargetPlatform, RequestedPackageAndVersion $requested, bool $force) use ($composer, $targetPlatform, $requestedA, $requestedB, $resolvedA, $resolvedB): ResolvedPackageRequest {
+                    self::assertSame($composer, $givenComposer);
+                    self::assertSame($targetPlatform, $givenTargetPlatform);
+                    self::assertTrue($force);
+
+                    if ($requested === $requestedA) {
+                        return $resolvedA;
+                    }
+
+                    self::assertSame($requestedB, $requested);
+
+                    return $resolvedB;
+                },
+            );
+
+        $io = new BufferIO();
+
+        $resolvedPackages = CommandHelper::resolveRequestedPackages(
+            $dependencyResolver,
+            $io,
+            $composer,
+            $targetPlatform,
+            [$requestedA, $requestedB],
+            true,
+        );
+
+        self::assertSame([$resolvedA, $resolvedB], $resolvedPackages);
+        self::assertSame(
+            "Found package: foo/bar:1.0.0 which provides ext-bar\nFound package: baz/qux:2.0.0 which provides ext-qux",
+            str_replace("\r\n", "\n", trim($io->getOutput())),
+        );
+    }
+
+    public function testResolveRequestedPackagesPropagatesUnableToResolveRequirement(): void
+    {
+        $requested = new RequestedPackageAndVersion('foo/bar', null);
+
+        $exception = new UnableToResolveRequirement('Could not resolve foo/bar', $requested);
+
+        $dependencyResolver = $this->createMock(DependencyResolver::class);
+        $dependencyResolver->method('__invoke')->willThrowException($exception);
+
+        $this->expectExceptionObject($exception);
+
+        CommandHelper::resolveRequestedPackages(
+            $dependencyResolver,
+            new NullIO(),
+            $this->createMock(Composer::class),
+            $this->createMock(TargetPlatform::class),
+            [$requested],
+            false,
+        );
+    }
+
+    public function testResolveRequestedPackagesPropagatesBundledPhpExtensionRefusal(): void
+    {
+        $requested = new RequestedPackageAndVersion('foo/bar', null);
+
+        $exception = BundledPhpExtensionRefusal::forPackage(self::packageNamed('foo/bar', '1.0.0'));
+
+        $dependencyResolver = $this->createMock(DependencyResolver::class);
+        $dependencyResolver->method('__invoke')->willThrowException($exception);
+
+        $this->expectExceptionObject($exception);
+
+        CommandHelper::resolveRequestedPackages(
+            $dependencyResolver,
+            new NullIO(),
+            $this->createMock(Composer::class),
+            $this->createMock(TargetPlatform::class),
+            [$requested],
+            false,
+        );
+    }
+
     public function testProcessingConfigureOptionsFromInput(): void
     {
-        $composerPackage = $this->createMock(CompletePackage::class);
+        $composerPackage = $this->createMock(CompletePackageInterface::class);
         $composerPackage->method('getPrettyName')->willReturn('foo/bar');
         $composerPackage->method('getPrettyVersion')->willReturn('1.0.0');
         $composerPackage->method('getType')->willReturn('php-ext');
@@ -116,15 +262,50 @@ final class CommandHelperTest extends TestCase
 
         $input = new ArrayInput(['--with-stuff' => 'lolz', '--enable-thing' => true], $inputDefinition);
 
-        $options = CommandHelper::processConfigureOptionsFromInput($package, $input);
+        $options = CommandHelper::processConfigureOptionsFromInput([$package], $input);
 
         self::assertSame(
             [
-                '--with-stuff=lolz',
-                '--enable-thing',
+                'foo/bar' => [
+                    '--with-stuff=lolz',
+                    '--enable-thing',
+                ],
             ],
             $options,
         );
+    }
+
+    public function testBindConfigureOptionsFromPackageThrowsWhenTwoPackagesDeclareSameOptionName(): void
+    {
+        $composerPackageA = $this->createMock(CompletePackageInterface::class);
+        $composerPackageA->method('getPrettyName')->willReturn('foo/bar');
+        $composerPackageA->method('getPrettyVersion')->willReturn('1.0.0');
+        $composerPackageA->method('getType')->willReturn('php-ext');
+        $composerPackageA->method('getPhpExt')->willReturn([
+            'configure-options' => [
+                ['name' => 'with-stuff', 'needs-value' => true],
+            ],
+        ]);
+        $packageA = Package::fromComposerCompletePackage($composerPackageA);
+
+        $composerPackageB = $this->createMock(CompletePackageInterface::class);
+        $composerPackageB->method('getPrettyName')->willReturn('baz/qux');
+        $composerPackageB->method('getPrettyVersion')->willReturn('2.0.0');
+        $composerPackageB->method('getType')->willReturn('php-ext');
+        $composerPackageB->method('getPhpExt')->willReturn([
+            'configure-options' => [
+                ['name' => 'with-stuff'],
+            ],
+        ]);
+        $packageB = Package::fromComposerCompletePackage($composerPackageB);
+
+        $command = new Command();
+        $input   = new ArrayInput([]);
+
+        $this->expectException(ConfigureOptionCollision::class);
+        $this->expectExceptionMessage('Both foo/bar and baz/qux declare a configure option named --with-stuff');
+
+        CommandHelper::bindConfigureOptionsFromPackage($command, [$packageA, $packageB], $input);
     }
 
     #[RequiresOperatingSystemFamily('Windows')]
@@ -132,13 +313,13 @@ final class CommandHelperTest extends TestCase
     {
         $command = new Command();
         $input   = new ArrayInput(['--with-php-config' => 'C:\path\to\php-config']);
-        $output  = new NullOutput();
+        $io      = new NullIO();
         CommandHelper::configureDownloadBuildInstallOptions($command);
         CommandHelper::validateInput($input, $command);
 
         $this->expectException(InvalidArgumentException::class);
         $this->expectExceptionMessage('The --with-php-config=/path/to/php-config cannot be used on Windows, use --with-php-path=/path/to/php instead.');
-        CommandHelper::determineTargetPlatformFromInputs($input, $output);
+        CommandHelper::determineTargetPlatformFromInputs($input, $io);
     }
 
     public function testNonWindowsMachinesCannotUseWithPhpPathOption(): void
@@ -149,13 +330,13 @@ final class CommandHelperTest extends TestCase
 
         $command = new Command();
         $input   = new ArrayInput(['--with-php-path' => '/usr/bin/php']);
-        $output  = new NullOutput();
+        $io      = new NullIO();
         CommandHelper::configureDownloadBuildInstallOptions($command);
         CommandHelper::validateInput($input, $command);
 
         $this->expectException(InvalidArgumentException::class);
         $this->expectExceptionMessage('The --with-php-path=/path/to/php cannot be used on non-Windows, use --with-php-config=/path/to/php-config instead.');
-        CommandHelper::determineTargetPlatformFromInputs($input, $output);
+        CommandHelper::determineTargetPlatformFromInputs($input, $io);
     }
 
     #[RequiresOperatingSystemFamily('Windows')]
@@ -163,18 +344,165 @@ final class CommandHelperTest extends TestCase
     {
         $command = new Command();
         $input   = new ArrayInput(['--with-phpize-path' => 'C:\path\to\phpize']);
-        $output  = new NullOutput();
+        $io      = new NullIO();
         CommandHelper::configureDownloadBuildInstallOptions($command);
         CommandHelper::validateInput($input, $command);
 
         $this->expectException(InvalidArgumentException::class);
         $this->expectExceptionMessage('The --with-phpize-path=/path/to/phpize cannot be used on Windows.');
-        CommandHelper::determineTargetPlatformFromInputs($input, $output);
+        CommandHelper::determineTargetPlatformFromInputs($input, $io);
+    }
+
+    public function testDetermineSuppressedDownloadUrlMethodsDefaultsToEmpty(): void
+    {
+        $command = new Command();
+        $input   = new ArrayInput([]);
+        CommandHelper::configureDownloadBuildInstallOptions($command);
+        CommandHelper::validateInput($input, $command);
+
+        self::assertSame([], CommandHelper::determineSuppressedDownloadUrlMethods($input));
+    }
+
+    public function testDetermineSuppressedDownloadUrlMethodsParsesGivenValues(): void
+    {
+        $command = new Command();
+        $input   = new ArrayInput(['--suppress-download-url-method' => ['composer-default', 'pre-packaged-source']]);
+        CommandHelper::configureDownloadBuildInstallOptions($command);
+        CommandHelper::validateInput($input, $command);
+
+        self::assertSame(
+            [DownloadUrlMethod::ComposerDefaultDownload, DownloadUrlMethod::PrePackagedSourceDownload],
+            CommandHelper::determineSuppressedDownloadUrlMethods($input),
+        );
+    }
+
+    public function testDetermineSuppressedDownloadUrlMethodsThrowsForInvalidValue(): void
+    {
+        $command = new Command();
+        $input   = new ArrayInput(['--suppress-download-url-method' => ['not-a-real-method']]);
+        CommandHelper::configureDownloadBuildInstallOptions($command);
+        CommandHelper::validateInput($input, $command);
+
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage('Invalid value "not-a-real-method" for --suppress-download-url-method; valid values are: composer-default, windows-binary, pre-packaged-source, pre-packaged-binary');
+        CommandHelper::determineSuppressedDownloadUrlMethods($input);
+    }
+
+    private function targetPlatformWithExtensionPaths(string|null $phpConfigExtensionPath, string $iniExtensionPath): TargetPlatform
+    {
+        $phpBinary = $this->createMock(PhpBinaryPath::class);
+        $phpBinary->method('phpConfigExtensionPath')->willReturn($phpConfigExtensionPath);
+        $phpBinary->method('extensionPath')->willReturn($iniExtensionPath);
+
+        return new TargetPlatform(
+            OperatingSystem::NonWindows,
+            OperatingSystemFamily::Linux,
+            $phpBinary,
+            Architecture::x86_64,
+            ThreadSafetyMode::NonThreadSafe,
+            1,
+            null,
+            null,
+        );
+    }
+
+    /** @return non-empty-string */
+    private function realTempDir(): string
+    {
+        $dir = sys_get_temp_dir() . DIRECTORY_SEPARATOR . uniqid('pie-test-extension-dir-', true);
+        mkdir($dir, 0777, true);
+
+        return $dir;
+    }
+
+    public function testAssertExtensionPathDoesNothingWhenPhpConfigNotUsed(): void
+    {
+        $targetPlatform = $this->targetPlatformWithExtensionPaths(null, $this->realTempDir());
+        $io             = new BufferIO();
+
+        CommandHelper::assertExtensionPathIsConsistent($targetPlatform, new ArrayInput([]), $io);
+
+        self::assertSame('', $io->getOutput());
+    }
+
+    public function testAssertExtensionPathDoesNothingWhenPathsMatch(): void
+    {
+        $dir            = $this->realTempDir();
+        $targetPlatform = $this->targetPlatformWithExtensionPaths($dir, $dir);
+        $io             = new BufferIO();
+
+        CommandHelper::assertExtensionPathIsConsistent($targetPlatform, new ArrayInput([]), $io);
+
+        self::assertSame('', $io->getOutput());
+    }
+
+    public function testAssertExtensionPathDoesNothingWhenPathsAreSymlinkedToTheSameRealPath(): void
+    {
+        if (Platform::isWindows()) {
+            self::markTestSkipped('Skipping for Windows as ineffective');
+        }
+
+        $realDir = $this->realTempDir();
+
+        $symlinkPath = sys_get_temp_dir() . DIRECTORY_SEPARATOR . uniqid('pie-test-extension-dir-symlink-', true);
+        symlink($realDir, $symlinkPath);
+
+        $targetPlatform = $this->targetPlatformWithExtensionPaths($symlinkPath, $realDir);
+        $io             = new BufferIO();
+
+        CommandHelper::assertExtensionPathIsConsistent($targetPlatform, new ArrayInput([]), $io);
+
+        self::assertSame('', $io->getOutput());
+    }
+
+    public function testAssertExtensionPathThrowsWhenPathsMatch(): void
+    {
+        $phpConfigExtensionPath = $this->realTempDir();
+        $iniExtensionPath       = $this->realTempDir();
+        $targetPlatform         = $this->targetPlatformWithExtensionPaths($phpConfigExtensionPath, $iniExtensionPath);
+
+        $this->expectException(RuntimeException::class);
+        $this->expectExceptionMessage(<<<EXCEPTION
+            The php.ini `extension_dir` directive ($iniExtensionPath) does not match `php-config --extension-dir` ($phpConfigExtensionPath). This means
+            that installs will likely fail (as the extension will be installed in one place, but PHP is looking in
+            another place).
+
+            Re-run with --force to attempt the install anyway.
+            EXCEPTION);
+
+        CommandHelper::assertExtensionPathIsConsistent($targetPlatform, new ArrayInput([]), new BufferIO());
+    }
+
+    public function testAssertExtensionPathWarnsWhenPathsMatchButLukeUsesTheForce(): void
+    {
+        $phpConfigExtensionPath = $this->realTempDir();
+        $iniExtensionPath       = $this->realTempDir();
+        $targetPlatform         = $this->targetPlatformWithExtensionPaths($phpConfigExtensionPath, $iniExtensionPath);
+
+        $command = new Command();
+        CommandHelper::configureDownloadBuildInstallOptions($command);
+        $input = new ArrayInput(['--force' => true]);
+        CommandHelper::validateInput($input, $command);
+
+        $io = new BufferIO();
+
+        CommandHelper::assertExtensionPathIsConsistent($targetPlatform, $input, $io);
+
+        self::assertStringContainsString(
+            <<<WARNING
+            Warning: The php.ini `extension_dir` directive ($iniExtensionPath) does not match `php-config --extension-dir` ($phpConfigExtensionPath). This means
+            that installs will likely fail (as the extension will be installed in one place, but PHP is looking in
+            another place).
+
+            Proceeding anyway because --force was used.
+            WARNING,
+            $io->getOutput(),
+        );
     }
 
     public function testListRepositories(): void
     {
-        $output = new BufferedOutput();
+        $io = new BufferIO();
 
         $packagistRepo = $this->createMock(ComposerRepository::class);
         $packagistRepo->method('getRepoConfig')->willReturn(['url' => 'https://repo.packagist.org']);
@@ -202,7 +530,7 @@ final class CommandHelperTest extends TestCase
         $composer = $this->createMock(Composer::class);
         $composer->method('getRepositoryManager')->willReturn($repoManager);
 
-        CommandHelper::listRepositories($composer, $output);
+        CommandHelper::listRepositories($composer, $io);
 
         self::assertSame(
             str_replace("\r\n", "\n", <<<'OUTPUT'
@@ -212,7 +540,7 @@ final class CommandHelperTest extends TestCase
               - VCS Repository (https://github.com/php/pie)
               - Path Repository (/path/to/repo)
             OUTPUT),
-            str_replace("\r\n", "\n", trim($output->fetch())),
+            str_replace("\r\n", "\n", trim($io->getOutput())),
         );
     }
 }

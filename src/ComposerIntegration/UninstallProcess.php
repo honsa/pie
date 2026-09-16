@@ -4,11 +4,11 @@ declare(strict_types=1);
 
 namespace Php\Pie\ComposerIntegration;
 
+use Composer\IO\IOInterface;
 use Composer\Package\CompletePackageInterface;
 use Php\Pie\DependencyResolver\Package;
 use Php\Pie\Installing\Ini\RemoveIniEntry;
 use Php\Pie\Installing\Uninstall;
-use Symfony\Component\Console\Output\OutputInterface;
 
 use function array_walk;
 use function count;
@@ -18,7 +18,6 @@ use function sprintf;
 /** @internal This is not public API for PIE, so should not be depended upon unless you accept the risk of BC breaks */
 class UninstallProcess
 {
-    /** @psalm-suppress PossiblyUnusedMethod no direct reference; used in service locator */
     public function __construct(
         private readonly RemoveIniEntry $removeIniEntry,
         private readonly Uninstall $uninstall,
@@ -29,30 +28,41 @@ class UninstallProcess
         PieComposerRequest $composerRequest,
         CompletePackageInterface $composerPackage,
     ): void {
-        $output = $composerRequest->pieOutput;
+        $io             = $composerRequest->pieOutput;
+        $targetPlatform = $composerRequest->targetPlatform;
 
         $piePackage = Package::fromComposerCompletePackage($composerPackage);
 
-        $affectedIniFiles = ($this->removeIniEntry)($piePackage, $composerRequest->targetPlatform, $output);
+        $status = $piePackage->verifyPackageStatus($composerRequest->targetPlatform);
 
-        if (count($affectedIniFiles) === 1) {
-            $output->writeln(
-                sprintf('INI file "%s" was updated to remove the extension.', reset($affectedIniFiles)),
-                OutputInterface::VERBOSITY_VERBOSE,
-            );
-        } elseif (count($affectedIniFiles) === 0) {
-            $output->writeln(
-                'No INI files were updated to remove the extension.',
-                OutputInterface::VERBOSITY_VERBOSE,
-            );
+        if ($status->isVerified()) {
+            $io->write(sprintf(
+                '👋 <info>Removed extension %s:</info> %s',
+                $piePackage->prettyNameAndVersion(),
+                ($this->uninstall)($targetPlatform, $piePackage)->filePath,
+            ));
         } else {
-            $output->writeln(
-                'The following INI files were updated to remove the extnesion:',
-                OutputInterface::VERBOSITY_VERBOSE,
-            );
-            array_walk($affectedIniFiles, static fn (string $ini) => $output->writeln(' - ' . $ini));
+            $io->writeError(sprintf('<warning>Did not remove extension file:</warning> %s', $status->description()));
         }
 
-        $output->writeln(sprintf('👋 <info>Removed extension:</info> %s', ($this->uninstall)($piePackage)->filePath));
+        $affectedIniFiles = ($this->removeIniEntry)($piePackage, $composerRequest->targetPlatform, $io);
+
+        if (count($affectedIniFiles) === 1) {
+            $io->write(
+                sprintf('INI file "%s" was updated to remove the extension.', reset($affectedIniFiles)),
+                verbosity: IOInterface::VERBOSE,
+            );
+        } elseif (count($affectedIniFiles) === 0) {
+            $io->write(
+                'No INI files were updated to remove the extension.',
+                verbosity: IOInterface::VERBOSE,
+            );
+        } else {
+            $io->write(
+                'The following INI files were updated to remove the extnesion:',
+                verbosity: IOInterface::VERBOSE,
+            );
+            array_walk($affectedIniFiles, static fn (string $ini) => $io->write(' - ' . $ini));
+        }
     }
 }

@@ -4,7 +4,8 @@ declare(strict_types=1);
 
 namespace Php\PieIntegrationTest\Installing;
 
-use Composer\Package\CompletePackage;
+use Composer\IO\BufferIO;
+use Composer\Package\CompletePackageInterface;
 use Php\Pie\DependencyResolver\Package;
 use Php\Pie\Downloading\DownloadedPackage;
 use Php\Pie\ExtensionName;
@@ -25,15 +26,14 @@ use PHPUnit\Framework\TestCase;
 use RecursiveDirectoryIterator;
 use RecursiveIteratorIterator;
 use SplFileInfo;
-use Symfony\Component\Console\Output\BufferedOutput;
 
 use function assert;
 use function dirname;
 use function file_exists;
 use function is_dir;
-use function rmdir;
+use function Safe\rmdir;
+use function Safe\unlink;
 use function str_replace;
-use function unlink;
 
 use const DIRECTORY_SEPARATOR;
 
@@ -47,7 +47,7 @@ final class WindowsInstallTest extends TestCase
     {
         $downloadedPackage = DownloadedPackage::fromPackageAndExtractedPath(
             new Package(
-                $this->createMock(CompletePackage::class),
+                $this->createMock(CompletePackageInterface::class),
                 ExtensionType::PhpModule,
                 ExtensionName::normaliseFromString('pie_test_ext'),
                 'php/pie-test-ext',
@@ -56,7 +56,7 @@ final class WindowsInstallTest extends TestCase
             ),
             self::TEST_EXTENSION_PATH,
         );
-        $output            = new BufferedOutput();
+        $output            = new BufferIO();
         $targetPlatform    = new TargetPlatform(
             OperatingSystem::Windows,
             OperatingSystemFamily::Windows,
@@ -65,16 +65,17 @@ final class WindowsInstallTest extends TestCase
             ThreadSafetyMode::ThreadSafe,
             1,
             WindowsCompiler::VS16,
+            null,
         );
         $phpPath           = dirname($targetPlatform->phpBinaryPath->phpBinaryPath);
         $extensionPath     = $targetPlatform->phpBinaryPath->extensionPath();
 
         $installer = new WindowsInstall(new SetupIniFile(new PickBestSetupIniApproach([])));
 
-        $installedDll = $installer->__invoke($downloadedPackage, $targetPlatform, $output, true);
+        $installedDll = $installer->__invoke($downloadedPackage, $targetPlatform, null, $output, true);
         self::assertSame($extensionPath . '\php_pie_test_ext.dll', $installedDll->filePath);
 
-        $outputString = $output->fetch();
+        $outputString = $output->getOutput();
 
         self::assertStringContainsString('Copied DLL to: ' . $extensionPath . '\php_pie_test_ext.dll', $outputString);
         self::assertStringContainsString('You must now add "extension=pie_test_ext" to your php.ini', $outputString);

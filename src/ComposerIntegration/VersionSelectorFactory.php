@@ -16,14 +16,13 @@ use Php\Pie\Platform\TargetPlatform;
 /** @internal This is not public API for PIE, so should not be depended upon unless you accept the risk of BC breaks */
 final class VersionSelectorFactory
 {
-    /** @psalm-suppress UnusedConstructor */
     private function __construct()
     {
     }
 
-    private static function factoryRepositorySet(Composer $composer, string|null $requestedVersion): RepositorySet
+    private static function factoryRepositorySet(Composer $composer, RequestedPackageAndVersion $requestedPackageAndVersion): RepositorySet
     {
-        $repositorySet = new RepositorySet(DetermineMinimumStability::fromRequestedVersion($requestedVersion));
+        $repositorySet = new RepositorySet(DetermineMinimumStability::fromRequestedVersion($requestedPackageAndVersion));
         $repositorySet->addRepository(new CompositeRepository($composer->getRepositoryManager()->getRepositories()));
 
         return $repositorySet;
@@ -35,8 +34,8 @@ final class VersionSelectorFactory
         TargetPlatform $targetPlatform,
     ): VersionSelector {
         return new VersionSelector(
-            self::factoryRepositorySet($composer, $requestedPackageAndVersion->version),
-            new PhpBinaryPathBasedPlatformRepository($targetPlatform->phpBinaryPath, $composer, new InstalledPiePackages(), null),
+            self::factoryRepositorySet($composer, $requestedPackageAndVersion),
+            new PhpBinaryPathBasedPlatformRepository($targetPlatform->phpBinaryPath, $composer, new InstalledPiePackages(), []),
         );
     }
 }

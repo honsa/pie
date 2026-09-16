@@ -5,21 +5,29 @@ declare(strict_types=1);
 namespace Php\PieIntegrationTest\Command;
 
 use Composer\Composer;
+use Composer\IO\IOInterface;
 use Composer\Package\Link;
 use Composer\Package\RootPackage;
 use Composer\Repository\InstalledArrayRepository;
 use Composer\Repository\RepositoryManager;
 use Composer\Semver\Constraint\Constraint;
+use Composer\Semver\Constraint\MultiConstraint;
 use Php\Pie\Command\InstallExtensionsForProjectCommand;
 use Php\Pie\ComposerIntegration\MinimalHelperSet;
 use Php\Pie\ComposerIntegration\PieJsonEditor;
 use Php\Pie\ComposerIntegration\QuieterConsoleIO;
+use Php\Pie\Container;
+use Php\Pie\DependencyResolver\RequestedPackageAndVersion;
 use Php\Pie\ExtensionType;
+use Php\Pie\Installing\InstallForPhpProject\CheckExtensionStatus;
 use Php\Pie\Installing\InstallForPhpProject\ComposerFactoryForProject;
 use Php\Pie\Installing\InstallForPhpProject\DetermineExtensionsRequired;
 use Php\Pie\Installing\InstallForPhpProject\FindMatchingPackages;
 use Php\Pie\Installing\InstallForPhpProject\InstallPiePackageFromPath;
 use Php\Pie\Installing\InstallForPhpProject\InstallSelectedPackage;
+use Php\Pie\Installing\InstallForPhpProject\SelectPackageForExtension;
+use Php\Pie\Platform\InstalledPiePackages;
+use Php\Pie\Platform\PiePackageList;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\MockObject\MockObject;
 use PHPUnit\Framework\TestCase;
@@ -30,10 +38,8 @@ use Symfony\Component\Console\Helper\QuestionHelper;
 use Symfony\Component\Console\Input\ArrayInput;
 use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\Console\Output\BufferedOutput;
-use Symfony\Component\Console\Output\OutputInterface;
-use Symfony\Component\Console\Tester\CommandTester;
 
-use function getcwd;
+use function Safe\getcwd;
 
 #[CoversClass(InstallExtensionsForProjectCommand::class)]
 final class InstallExtensionsForProjectCommandTest extends TestCase
@@ -41,6 +47,7 @@ final class InstallExtensionsForProjectCommandTest extends TestCase
     private CommandTester $commandTester;
     private ComposerFactoryForProject&MockObject $composerFactoryForProject;
     private FindMatchingPackages&MockObject $findMatchingPackages;
+    private InstalledPiePackages&MockObject $installedPiePackages;
     private InstallSelectedPackage&MockObject $installSelectedPackage;
     private QuestionHelper&MockObject $questionHelper;
     private InstallPiePackageFromPath&MockObject $installPiePackage;
@@ -53,33 +60,36 @@ final class InstallExtensionsForProjectCommandTest extends TestCase
         $container->method('get')->willReturnCallback(
             /** @param class-string $service */
             function (string $service): mixed {
-                switch ($service) {
-                    case QuieterConsoleIO::class:
-                        return new QuieterConsoleIO(
-                            new ArrayInput([]),
-                            new BufferedOutput(),
-                            new MinimalHelperSet(['question' => new QuestionHelper()]),
-                        );
-
-                    default:
-                        return $this->createMock($service);
-                }
+                /** @var class-string $service */
+                return match ($service) {
+                    QuieterConsoleIO::class => new QuieterConsoleIO(
+                        new ArrayInput([]),
+                        new BufferedOutput(),
+                        new MinimalHelperSet(['question' => new QuestionHelper()]),
+                    ),
+                    default => $this->createMock($service),
+                };
             },
         );
 
         $this->composerFactoryForProject = $this->createMock(ComposerFactoryForProject::class);
         $this->findMatchingPackages      = $this->createMock(FindMatchingPackages::class);
+        $this->installedPiePackages      = $this->createMock(InstalledPiePackages::class);
         $this->installSelectedPackage    = $this->createMock(InstallSelectedPackage::class);
         $this->installPiePackage         = $this->createMock(InstallPiePackageFromPath::class);
         $this->questionHelper            = $this->createMock(QuestionHelper::class);
 
+        Container::testFactory();
         $cmd = new InstallExtensionsForProjectCommand(
             $this->composerFactoryForProject,
             new DetermineExtensionsRequired(),
-            $this->findMatchingPackages,
+            $this->installedPiePackages,
+            new CheckExtensionStatus(Container::testBuffer()),
+            new SelectPackageForExtension($this->findMatchingPackages, Container::testBuffer()),
             $this->installSelectedPackage,
             $this->installPiePackage,
             $container,
+            Container::testBuffer(),
         );
         $cmd->setHelperSet(new HelperSet([
             'question' => $this->questionHelper,
@@ -91,8 +101,12 @@ final class InstallExtensionsForProjectCommandTest extends TestCase
     {
         $rootPackage = new RootPackage('my/project', '1.2.3.0', '1.2.3');
         $rootPackage->setRequires([
-            'ext-standard' => new Link('my/project', 'ext-standard', new Constraint('=', '*'), Link::TYPE_REQUIRE),
-            'ext-foobar' => new Link('my/project', 'ext-foobar', new Constraint('=', '*'), Link::TYPE_REQUIRE),
+            'ext-standard' => new Link('my/project', 'ext-standard', new Constraint('=', '*'), Link::TYPE_REQUIRE, '*'),
+            'ext-spl' => new Link('my/project', 'ext-spl', new Constraint('=', '*'), Link::TYPE_REQUIRE, '*'),
+            'ext-foobar' => new Link('my/project', 'ext-foobar', new MultiConstraint([
+                new Constraint('>=', '1.2.0.0-dev'),
+                new Constraint('<', '2.0.0.0-dev'),
+            ]), Link::TYPE_REQUIRE, '^1.2'),
         ]);
         $this->composerFactoryForProject->method('rootPackage')->willReturn($rootPackage);
 
@@ -107,16 +121,65 @@ final class InstallExtensionsForProjectCommandTest extends TestCase
 
         $this->composerFactoryForProject->method('composer')->willReturn($composer);
 
-        $this->findMatchingPackages->method('for')->willReturn([
+        $this->findMatchingPackages->method('byProvider')->willReturn([
             ['name' => 'vendor1/foobar', 'description' => 'The official foobar implementation'],
-            ['name' => 'vendor2/afoobar', 'description' => 'An improved async foobar extension'],
         ]);
 
         $this->questionHelper->method('ask')->willReturn('vendor1/foobar: The official foobar implementation');
 
         $this->installSelectedPackage->expects(self::once())
-            ->method('withPieCli')
-            ->with('vendor1/foobar');
+            ->method('withSubCommand')
+            ->with(
+                [
+                    new RequestedPackageAndVersion(
+                        'vendor1/foobar',
+                        '^1.2',
+                    ),
+                ],
+                self::isInstanceOf(Command::class),
+                self::isInstanceOf(InputInterface::class),
+            )
+            ->willReturn(0);
+
+        $this->installedPiePackages->method('allPiePackages')->willReturn(new PiePackageList([]));
+
+        $this->commandTester->execute(
+            ['--select' => ['foobar=vendor1/foobar']],
+            ['verbosity' => BufferedOutput::VERBOSITY_VERY_VERBOSE],
+        );
+
+        $outputString = $this->commandTester->getDisplay();
+
+        $this->commandTester->assertCommandIsSuccessful($outputString);
+        self::assertStringContainsString('Checking extensions for your project my/project', $outputString);
+        self::assertStringContainsString('requires: ext-standard:* ✅ Already installed', $outputString);
+        self::assertStringContainsString('requires: ext-spl:* ✅ Already installed', $outputString);
+        self::assertStringContainsString('requires: ext-foobar:^1.2 🚫 Missing', $outputString);
+    }
+
+    public function testInstallingExtensionsForPhpProjectIncludesDevRequiresByDefault(): void
+    {
+        $rootPackage = new RootPackage('my/project', '1.2.3.0', '1.2.3');
+        $rootPackage->setRequires([
+            'ext-standard' => new Link('my/project', 'ext-standard', new Constraint('=', '*'), Link::TYPE_REQUIRE, '*'),
+        ]);
+        $rootPackage->setDevRequires([
+            'ext-foobar' => new Link('my/project', 'ext-foobar', new Constraint('=', '*'), Link::TYPE_DEV_REQUIRE, '*'),
+        ]);
+        $this->composerFactoryForProject->method('rootPackage')->willReturn($rootPackage);
+
+        $installedRepository = new InstalledArrayRepository([$rootPackage]);
+
+        $repositoryManager = $this->createMock(RepositoryManager::class);
+        $repositoryManager->method('getLocalRepository')->willReturn($installedRepository);
+
+        $composer = $this->createMock(Composer::class);
+        $composer->method('getPackage')->willReturn($rootPackage);
+        $composer->method('getRepositoryManager')->willReturn($repositoryManager);
+
+        $this->composerFactoryForProject->method('composer')->willReturn($composer);
+
+        $this->installedPiePackages->method('allPiePackages')->willReturn(new PiePackageList([]));
 
         $this->commandTester->execute(
             [],
@@ -125,10 +188,97 @@ final class InstallExtensionsForProjectCommandTest extends TestCase
 
         $outputString = $this->commandTester->getDisplay();
 
-        $this->commandTester->assertCommandIsSuccessful();
         self::assertStringContainsString('Checking extensions for your project my/project', $outputString);
-        self::assertStringContainsString('requires: my/project requires ext-standard (== *) ✅ Already installed', $outputString);
-        self::assertStringContainsString('requires: my/project requires ext-foobar (== *) ⚠️  Missing', $outputString);
+        self::assertStringContainsString('requires: ext-standard:* ✅ Already installed', $outputString);
+        self::assertStringContainsString('ext-foobar:* 🚫 Missing', $outputString);
+    }
+
+    public function testInstallingExtensionsForPhpProjectExcludesDevRequiresWhenNoDevOptionSet(): void
+    {
+        $rootPackage = new RootPackage('my/project', '1.2.3.0', '1.2.3');
+        $rootPackage->setRequires([
+            'ext-standard' => new Link('my/project', 'ext-standard', new Constraint('=', '*'), Link::TYPE_REQUIRE, '*'),
+        ]);
+        $rootPackage->setDevRequires([
+            'ext-foobar' => new Link('my/project', 'ext-foobar', new Constraint('=', '*'), Link::TYPE_DEV_REQUIRE, '*'),
+        ]);
+        $this->composerFactoryForProject->method('rootPackage')->willReturn($rootPackage);
+
+        $installedRepository = new InstalledArrayRepository([$rootPackage]);
+
+        $repositoryManager = $this->createMock(RepositoryManager::class);
+        $repositoryManager->method('getLocalRepository')->willReturn($installedRepository);
+
+        $composer = $this->createMock(Composer::class);
+        $composer->method('getPackage')->willReturn($rootPackage);
+        $composer->method('getRepositoryManager')->willReturn($repositoryManager);
+
+        $this->composerFactoryForProject->method('composer')->willReturn($composer);
+
+        $this->installedPiePackages->method('allPiePackages')->willReturn(new PiePackageList([]));
+
+        $this->commandTester->execute(
+            ['--no-dev' => true],
+            ['verbosity' => BufferedOutput::VERBOSITY_VERY_VERBOSE],
+        );
+
+        $outputString = $this->commandTester->getDisplay();
+
+        $this->commandTester->assertCommandIsSuccessful($outputString);
+        self::assertStringContainsString('Checking extensions for your project my/project', $outputString);
+        self::assertStringContainsString('requires: ext-standard:* ✅ Already installed', $outputString);
+        self::assertStringNotContainsString('ext-foobar', $outputString);
+    }
+
+    public function testInstallingExtensionsForPhpProjectWithMultipleMatches(): void
+    {
+        $rootPackage = new RootPackage('my/project', '1.2.3.0', '1.2.3');
+        $rootPackage->setRequires([
+            'ext-standard' => new Link('my/project', 'ext-standard', new Constraint('=', '*'), Link::TYPE_REQUIRE, '*'),
+            'ext-foobar' => new Link('my/project', 'ext-foobar', new MultiConstraint([
+                new Constraint('>=', '1.2.0.0-dev'),
+                new Constraint('<', '2.0.0.0-dev'),
+            ]), Link::TYPE_REQUIRE, '^1.2'),
+        ]);
+        $this->composerFactoryForProject->method('rootPackage')->willReturn($rootPackage);
+
+        $installedRepository = new InstalledArrayRepository([$rootPackage]);
+
+        $repositoryManager = $this->createMock(RepositoryManager::class);
+        $repositoryManager->method('getLocalRepository')->willReturn($installedRepository);
+
+        $composer = $this->createMock(Composer::class);
+        $composer->method('getPackage')->willReturn($rootPackage);
+        $composer->method('getRepositoryManager')->willReturn($repositoryManager);
+
+        $this->composerFactoryForProject->method('composer')->willReturn($composer);
+
+        $this->findMatchingPackages->method('byProvider')->willReturn([
+            ['name' => 'vendor1/foobar', 'description' => 'The official foobar implementation'],
+            ['name' => 'vendor2/afoobar', 'description' => 'An improved async foobar extension'],
+        ]);
+
+        $this->questionHelper->method('ask')->willReturn('vendor1/foobar: The official foobar implementation');
+
+        $this->installSelectedPackage->expects(self::never())
+            ->method('withSubCommand');
+
+        $this->installedPiePackages->method('allPiePackages')->willReturn(new PiePackageList([]));
+
+        $this->commandTester->execute(
+            [],
+            ['verbosity' => BufferedOutput::VERBOSITY_VERY_VERBOSE],
+        );
+
+        $outputString = $this->commandTester->getDisplay();
+
+        self::assertSame(Command::FAILURE, $this->commandTester->getStatusCode());
+        self::assertStringContainsString('Checking extensions for your project my/project', $outputString);
+        self::assertStringContainsString('requires: ext-standard:* ✅ Already installed', $outputString);
+        self::assertStringContainsString('requires: ext-foobar:^1.2 🚫 Missing', $outputString);
+        self::assertStringContainsString('No package selections were made for ext-foobar; you MUST specify a package selection', $outputString);
+        self::assertStringContainsString('--select=foobar=vendor1/foobar', $outputString);
+        self::assertStringContainsString('--select=foobar=vendor2/afoobar', $outputString);
     }
 
     public function testInstallingExtensionsForPieProject(): void
@@ -146,7 +296,7 @@ final class InstallExtensionsForProjectCommandTest extends TestCase
                 $rootPackage,
                 self::isInstanceOf(PieJsonEditor::class),
                 self::isInstanceOf(InputInterface::class),
-                self::isInstanceOf(OutputInterface::class),
+                self::isInstanceOf(IOInterface::class),
             )
             ->willReturn(Command::SUCCESS);
 

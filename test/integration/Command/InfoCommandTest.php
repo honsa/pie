@@ -7,22 +7,22 @@ namespace Php\PieIntegrationTest\Command;
 use Php\Pie\Command\InfoCommand;
 use Php\Pie\Container;
 use PHPUnit\Framework\Attributes\CoversClass;
-use PHPUnit\Framework\TestCase;
-use Symfony\Component\Console\Tester\CommandTester;
 
 #[CoversClass(InfoCommand::class)]
-final class InfoCommandTest extends TestCase
+final class InfoCommandTest extends IsolatedWorkingDirectoryTestCase
 {
     private CommandTester $commandTester;
 
     public function setUp(): void
     {
-        $this->commandTester = new CommandTester(Container::factory()->get(InfoCommand::class));
+        parent::setUp();
+
+        $this->commandTester = new CommandTester(Container::testFactory()->get(InfoCommand::class));
     }
 
     public function testInfoCommandDisplaysInformation(): void
     {
-        $this->commandTester->execute(['requested-package-and-version' => 'asgrim/example-pie-extension:dev-main#9b5e6c80a1e05556e4e6824f0c112a4992cee001']);
+        $this->commandTester->execute(['requested-package-and-version' => ['asgrim/example-pie-extension:dev-main#9b5e6c80a1e05556e4e6824f0c112a4992cee001']]);
 
         $this->commandTester->assertCommandIsSuccessful();
 

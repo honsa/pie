@@ -39,6 +39,24 @@ do this in the right way for PIE.
 Adding PIE support for your extension is relatively straightforward, and the
 flow is quite similar to adding a regular PHP package into Packagist.
 
+### Extensions already on PECL
+
+If you are a maintainer of an existing PECL extension, here are a few helpful
+pieces of information for some context:
+
+ - For an extension already in PECL, the `package.xml` is no longer needed if
+   you no longer want to publish to PECL. If you want to keep publishing to
+   PECL for now, then you can keep `package.xml` maintained.
+ - The `package.xml` lists each release explicitly. With PIE, this is no longer
+   necessary, as Packagist will pick up tags or branch aliases in the same
+   way that regular Composer packages do. This means that to release your
+   package, you need to push a tag and release.
+ - In the default setup, the contents of the package are determined by the
+   [Git archive](https://git-scm.com/docs/git-archive) for the tag or revision
+   of the release. You can exclude files and paths from the archive with the
+   [export-ignore](https://git-scm.com/docs/git-archive#Documentation/git-archive.txt-export-ignore)
+   attribute.
+
 ### Add a `composer.json` to your extension
 
 The first step to adding PIE support is adding a `composer.json` to your
@@ -210,26 +228,133 @@ The `build-path` may contain some templated values which are replaced:
 ##### `download-url-method`
 
 The `download-url-method` directive allows extension maintainers to
-change the behaviour of downloading the source package.
+change the behaviour of downloading the source package. This should be defined
+as a list of supported methods, but for backwards compatibility a single
+string may be used.
 
- * Setting this to `composer-default`, which is the default value if not
-   specified, will use the default behaviour implemented by Composer, which is
-   to use the standard ZIP archive from the GitHub API (or other source control
-   system).
- * Using `pre-packaged-source` will locate a source code package in the release
-   assets list based matching one of the following naming conventions:
-   * `php_{ExtensionName}-{Version}-src.tgz` (e.g. `php_myext-1.20.1-src.tgz`)
-   * `php_{ExtensionName}-{Version}-src.zip` (e.g. `php_myext-1.20.1-src.zip`)
-   * `{ExtensionName}-{Version}.tgz` (this is intended for backwards
-     compatibility with PECL packages)
+The possible values are:
+
+ - `composer-default`
+ - `pre-packaged-source`
+ - `pre-packaged-binary`
+
+The default value, if nothing is specified is `["composer-default"]`.
+
+###### composer-default
+
+Setting this to `composer-default`, which is the default value if nothing is
+specified, will use the default behaviour implemented by Composer, which is
+to use the standard ZIP archive from the GitHub API (or other source control
+system). PIE will then build and install the extension from source.
+
+###### pre-packaged-source
+
+Using `pre-packaged-source` will locate a source code package in the release
+assets list based matching one of the following naming conventions:
+
+* `php_{ExtensionName}-{Version}-src.tgz` (e.g. `php_myext-1.20.1-src.tgz`)
+* `php_{ExtensionName}-{Version}-src.zip` (e.g. `php_myext-1.20.1-src.zip`)
+* `{ExtensionName}-{Version}.tgz` (this is intended for backwards
+  compatibility with PECL packages)
+
+This is useful for scenarios where you might need additional dependencies
+pulled into the source build, which would not be available if you downloaded
+the ZIP archive from your repository. For example, if your extension uses Git
+Submodules to include third party libraries statically in the build.
+
+###### pre-packaged-binary
+
+> [!CAUTION]
+> If your extension depends on dynamically linked libraries, it is **not
+> recommended** to use `pre-packaged-binary` option, as the correct version,
+> or at least compatible linked libraries may not be available on the end
+> user's system. Use with caution!
+
+Using `pre-packaged-binary` will attempt to locate a Zip (or TGZ) archive in
+the release assets list based on matching one of the following naming
+conventions:
+
+  * `php_{ExtensionName}-{Version}_php{PhpVersion}-{Arch}-{OS}-{Libc}-{Debug}-{TSMode}.{Format}`
+
+The replacements are:
+
+  * `{ExtensionName}` the name of your extension, e.g. `yourext` (hint: this
+    is not your Composer package name!)
+  * `{PhpVersion}` the major and minor version of PHP, e.g. `8.5`
+  * `{Version}` the version of your extension, e.g. `1.20.1`
+  * `{Arch}` the architecture of the binary, one of `x86`, `x86_64`, `arm64`
+  * `{OS}` the operating system, one of `windows`, `darwin`, `linux`, `bsd`, `solaris`, `unknown`
+  * `{Libc}` the libc flavour, one of `glibc`, `musl`, `bsdlibc`
+  * `{Debug}` the debug mode, one of `debug`, `nodebug` (or omitted)
+  * `{TSMode}` the thread safety mode, one of `zts`, `nts` (or omitted)
+  * `{Format}` the archive format, one of `zip`, `tgz` - note that ZIP is
+    preferred as it means there are fewer dependencies for the end user
+
+> [!TIP]
+> In order to generate pre-built binaries for PIE, you could use the
+> [php/pie-ext-binary-builder](https://github.com/php/pie-ext-binary-builder)
+> GitHub Action. This will build and name the assets correctly for you.
+
+Some examples of valid asset names:
+
+ * `php_yourext-4.1_php8.4-x86_64-linux-glibc.zip` (or `php_yourext-4.1_php8.4-x86_64-glibc-nts.zip`)
+ * `php_yourext-4.1_php8.4-x86_64-linux-musl.zip` (or `php_yourext-4.1_php8.4-x86_64-musl-nts.zip`)
+ * `php_yourext-4.1_php8.4-arm64-linux-glibc.zip` (or `php_yourext-4.1_php8.4-arm64-glibc-nts.zip`)
+ * `php_yourext-4.1_php8.4-arm64-linux-musl.zip` (or `php_yourext-4.1_php8.4-arm64-musl-nts.zip`)
+ * `php_yourext-4.1_php8.4-x86_64-linux-glibc-zts.zip`
+ * `php_yourext-4.1_php8.4-x86_64-linux-musl-zts.zip`
+ * `php_yourext-4.1_php8.4-arm64-linux-glibc-zts.zip`
+ * `php_yourext-4.1_php8.4-arm64-linux-musl-zts.zip`
+ * `php_yourext-4.1_php8.4-x86_64-linux-glibc-debug.zip`
+ * `php_yourext-4.1_php8.4-x86_64-linux-musl-debug.zip`
+ * `php_yourext-4.1_php8.4-arm64-linux-glibc-debug.zip`
+ * `php_yourext-4.1_php8.4-arm64-linux-musl-debug.zip`
+
+It is recommended that `pre-packaged-binary` is combined with `composer-default`
+as a fallback mechanism, if a particular combination is supported, but not
+pre-packaged on the release, e.g. `"download-url-method": ["pre-packaged-binary", "composer-default"]`.
+PIE will try to find a pre-packaged binary asset first, but if it cannot
+find an appropriate binary, it will download the source code and build it
+in the traditional manner.
+
+```json
+{
+    "name": "myvendor/myext",
+    "php-ext": {
+        "download-url-method": ["pre-packaged-binary", "composer-default"]
+    }
+}
+```
+
+##### `os-families` restrictions
+
+The `os-families` and `os-families-exclude` directive allow extention maintainers
+to restrict the Operating System compatibility.
+
+ * `os-families` An array of OS families to mark as compatible with the extension.
+   (e.g. `"os-families": ["windows"]` for an extension only available on Windows)
+ * `os-families-exclude` An array of OS families to mark as incompatible with the
+   extension. (e.g. `"os-families-exclude": ["windows"]` for an extension that
+   cannot be installed available on Windows)
+
+The list of accepted OS families: "windows", "bsd", "darwin", "solaris", "linux",
+"unknown"
+
+> [!WARNING]
+> Only one of `os-families` and `os-families-exclude` can be defined.
 
 #### Extension dependencies
 
-Extension authors may define some dependencies in `require`, but practically,
+Extension authors may define some dependencies in `require`, but typically,
 most extensions would not need to define dependencies, except for the PHP
-versions supported by the extension. Dependencies on other extensions may be
-defined, for example `ext-json`. However, dependencies on a regular PHP package
-(such as `monolog/monolog`) SHOULD NOT be specified in your `require` section.
+versions supported by the extension, and system libraries.
+
+Dependencies on a regular PHP package (such as `monolog/monolog`) SHOULD NOT be
+specified in your extension's `require` section.
+
+##### Dependencies on other extensions
+
+Dependencies on other extensions may be defined, for example `ext-json`.
 
 It is worth noting that if your extension does define a dependency on another
 dependency, and this is not available, someone installing your extension would
@@ -239,6 +364,108 @@ receive a message such as:
 Cannot use myvendor/myextension's latest version 1.2.3 as it requires
 ext-something * which is missing from your platform.
 ```
+
+##### System Library Dependencies
+
+In PIE 1.4.0, the ability for extension authors to define system library
+dependencies was added, and in some cases, automatically install them.
+
+The following libraries are supported at the moment. **If you would like to add
+a library, please [open a discussion](https://github.com/php/pie/discussions)
+in the first instance.** Don't just open a PR without discussing first please!
+
+We are adding libraries and improving this feature over time. If the automatic
+install of a system dependency that is supported below in your package manager
+is NOT working, then please [report a bug](https://github.com/php/pie/issues).
+
+| Library       | Checked by PIE | Auto-installs in   |
+|---------------|----------------|--------------------|
+| lib-curl      | ✅              | apt, apk, dnf, yum |
+| lib-enchant   | ✅              | ❌                  |
+| lib-enchant-2 | ✅              | ❌                  |
+| lib-sodium    | ✅              | apt, apk, dnf, yum |
+| lib-ffi       | ✅              | apt, apk, dnf, yum |
+| lib-xslt      | ✅              | apt, apk, dnf, yum |
+| lib-zip       | ✅              | apt, apk, dnf, yum |
+| lib-png       | ✅              | ❌                  |
+| lib-avif      | ✅              | ❌                  |
+| lib-webp      | ✅              | ❌                  |
+| lib-jpeg      | ✅              | apt, apk, dnf, yum |
+| lib-xpm       | ✅              | ❌                  |
+| lib-freetype2 | ✅              | ❌                  |
+| lib-gdlib     | ✅              | ❌                  |
+| lib-gmp       | ✅              | ❌                  |
+| lib-gpgme     | ✅              | apt, apk, dnf, yum |
+| lib-pam       | ✅              | apt, apk, dnf, yum |
+| lib-sasl      | ✅              | ❌                  |
+| lib-onig      | ✅              | ❌                  |
+| lib-odbc      | ✅              | ❌                  |
+| lib-capstone  | ✅              | ❌                  |
+| lib-pcre      | ✅              | ❌                  |
+| lib-edit      | ✅              | ❌                  |
+| lib-snmp      | ✅              | ❌                  |
+| lib-argon2    | ✅              | ❌                  |
+| lib-uriparser | ✅              | ❌                  |
+| lib-exslt     | ✅              | ❌                  |
+
+#### Checking the extension will work
+
+First up, you can use `composer validate` to check your `composer.json` is
+formatted correctly, e.g.:
+
+```shelle
+$ composer validate
+./composer.json is valid
+```
+
+You may then use `pie install` to install your extension while in its directory:
+
+```shell
+$ cd /path/to/my/extension
+$ pie install
+🥧 PHP Installer for Extensions (PIE) 1.0.0, from The PHP Foundation
+Installing PIE extension from /home/james/workspace/phpf/example-pie-extension
+This command may need elevated privileges, and may prompt you for your password.
+You are running PHP 8.4.8
+Target PHP installation: 8.4.8 nts, on Linux/OSX/etc x86_64 (from /usr/bin/php8.4)
+Found package: asgrim/example-pie-extension:dev-main which provides ext-example_pie_extension
+Extracted asgrim/example-pie-extension:dev-main source to: /home/james/.config/pie/php8.4_572ee73609adb95bf0b8539fecdc5c0e/vendor/asgrim/example-pie-extension
+Build files cleaned up.
+phpize complete.
+Configure complete.
+Build complete: /home/james/.config/pie/php8.4_572ee73609adb95bf0b8539fecdc5c0e/vendor/asgrim/example-pie-extension/modules/example_pie_extension.so
+Cannot write to /usr/lib/php/20240924, so using sudo to elevate privileges.
+Install complete: /usr/lib/php/20240924/example_pie_extension.so
+✅ Extension is enabled and loaded in /usr/bin/php8.4
+```
+
+##### Building without installing
+
+If you want to just test the build of your application, without installling it
+to your target PHP version, you will first need to your extension directory as
+a "path" type repository:
+
+```shell
+$ cd /path/to/my/extension
+$ pie repository:add path .
+🥧 PHP Installer for Extensions (PIE) 1.0.0, from The PHP Foundation
+You are running PHP 8.4.8
+Target PHP installation: 8.4.8 nts, on Linux/OSX/etc x86_64 (from /usr/bin/php8.4)
+The following repositories are in use for this Target PHP:
+  - Path Repository (/home/james/workspace/phpf/example-pie-extension)
+  - Packagist
+```
+
+Then you may test that it builds with:
+
+```shell
+$ pie build asgrim/example-pie-extension:*@dev
+```
+
+> [!TIP]
+> Since your extension is not yet published to Packagist, you should specify
+> `*@dev` as the version constraint, otherwise PIE will not find your extension
+> as the default stability is `stable`.
 
 ### Submit the extension to Packagist
 
@@ -258,42 +485,12 @@ Windows-compatible releases is:
  - A CI pipeline runs to build the release assets, e.g. in a GitHub Action
  - The resulting build assets are published to the GitHub release in a ZIP file
 
-The name of the ZIP file, and the DLL contained within must be:
+##### PHP-provided GitHub automation (recommended)
 
-* `php_{extension-name}-{tag}-{php-maj/min}-{ts|nts}-{compiler}-{arch}.zip`
-* Example: `php_xdebug-3.3.2-8.3-ts-vs16-x86_64.zip`
-
-The descriptions of these items:
-
-* `extension-name` the name of the extension, e.g. `xdebug`
-* `tag` for example `3.3.0alpha3` - defined by the tag/release you have made
-* `php-maj/min` - for example `8.3` for PHP 8.3.*
-* `compiler` - usually something like `vc6`, `vs16` - fetch from
-  'PHP Extension Build' flags in `php -i`
-* `ts|nts` - Thread-safe or non-thread safe.
-* `arch` - for example `x86_64`.
-   * Windows: `Architecture` from `php -i`
-   * non-Windows: check `PHP_INT_SIZE` - 4 for 32-bit, 8 for 64-bit.
-
-#### Contents of the Windows ZIP
-
-The pre-built ZIP should contain at minimum a DLL named in the same way as the
-ZIP itself, for example
-`php_{extension-name}-{tag}-{php-maj/min}-{ts|nts}-{compiler}-{arch}.dll`.
-The `.dll` will be moved into the PHP extensions path, and renamed, e.g.
-to `C:\path\to\php\ext\php_{extension-name}.dll`. The ZIP file may include
-additional resources, such as:
-
-* `php_{extension-name}-{tag}-{php-maj/min}-{ts|nts}-{compiler}-{arch}.pdb` -
-  this will be moved alongside the `C:\path\to\php\ext\php_{extension-name}.dll`
-* `*.dll` - any other `.dll` would be moved alongside `C:\path\to\php\php.exe`
-* Any other file, which would be moved
-  into `C:\path\to\php\extras\{extension-name}\.`
-
-#### Automation of the Windows publishing
-
-PHP provides a [set of GitHub Actions](https://github.com/php/php-windows-builder)
-that enable extension maintainers to build and release the Windows compatible
+We **highly** recommend using the `php/php-windows-builder` action to automate
+this process. PHP provides a
+[set of GitHub Actions](https://github.com/php/php-windows-builder) that enable
+extension maintainers to easily build and release the Windows compatible
 assets. An example workflow that uses these actions:
 
 ```yaml
@@ -342,4 +539,76 @@ jobs:
               token: ${{ secrets.GITHUB_TOKEN }}
 ```
 
-Source: [https://github.com/php/php-windows-builder?tab=readme-ov-file#example-workflow-to-build-and-release-an-extension](https://github.com/php/php-windows-builder?tab=readme-ov-file#example-workflow-to-build-and-release-an-extension)
+Check out some more examples and usage here: [https://github.com/php/php-windows-builder?tab=readme-ov-file#examples](https://github.com/php/php-windows-builder?tab=readme-ov-file#examples)
+
+#### Manual definition
+
+> [!WARNING]
+> We highly recommend using the `php/php-windows-builder` action provided by
+> the PHP group as your automated release process, as mentioned above. If you
+> manually define your workflow, you must accept that there may be breakages,
+> or flow changes that mean you must maintain your own pipeline.
+
+##### Manual artifact naming scheme
+
+If, for some reason, the `php/php-windows-builder` automation above is not
+possible, you can manually build the PIE-compatible packages, but you must
+ensure you stick to the conventions defined here.
+
+The name of the ZIP file, and the DLL contained within must be:
+
+* `php_{extension-name}-{tag}-{php-maj/min}-{ts|nts}-{compiler}-{arch}.zip`
+* Example: `php_xdebug-3.3.2-8.3-ts-vs16-x86_64.zip`
+
+The descriptions of these items:
+
+* `extension-name` the name of the extension, e.g. `xdebug`
+* `tag` for example `3.3.0alpha3` - defined by the tag/release you have made
+* `php-maj/min` - for example `8.3` for PHP 8.3.*
+* `compiler` - usually something like `vc6`, `vs16` - fetch from
+  'PHP Extension Build' flags in `php -i`
+* `ts|nts` - Thread-safe or non-thread safe.
+* `arch` - for example `x86_64`.
+   * Windows: use a hint from `Architecture` from `php -i` (see below)
+   * non-Windows: check `PHP_INT_SIZE` - 4 for 32-bit, 8 for 64-bit.
+
+Note the architecture name will likely need normalising, since different
+platforms name architectures differently. PIE expects the following normalised
+architectures:
+
+ * `x86_64` (normalised from `x64`, `x86_64`, `AMD64`)
+ * `arm64` (normalised from `arm64`)
+ * `x86` (any other value)
+
+For the latest map (in case documentation is not up to date), check out
+`\Php\Pie\Platform\Architecture::parseArchitecture`.
+
+##### Contents of the Windows ZIP
+
+The pre-built ZIP should contain at minimum a DLL named in the same way as the
+ZIP itself, for example
+`php_{extension-name}-{tag}-{php-maj/min}-{ts|nts}-{compiler}-{arch}.dll`.
+The `.dll` will be moved into the PHP extensions path, and renamed, e.g.
+to `C:\path\to\php\ext\php_{extension-name}.dll`. The ZIP file may include
+additional resources, such as:
+
+* `php_{extension-name}-{tag}-{php-maj/min}-{ts|nts}-{compiler}-{arch}.pdb` -
+  this will be moved alongside the `C:\path\to\php\ext\php_{extension-name}.dll`
+* `*.dll` - any other `.dll` would be moved alongside `C:\path\to\php\php.exe`
+* Any other file, which would be moved
+  into `C:\path\to\php\extras\{extension-name}\.`
+
+## Other features
+
+### Placeholder Replacement
+
+To help backwards compatibility with PECL extensions, PIE supports some automatic placeholder replacements within
+all `.c` and .`h` files found within the downloaded source directory. These placeholders are replaced after the
+download step, and before the build step. PIE will automatically replace the following placeholders:
+
+| Placeholder                                           | Description                                                                                                                            | Example                     |
+|-------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------|-----------------------------|
+| `@name@`, `@package_name@`, `@package-name@`          | The short, internal name of the PHP extension (e.g., `xdebug`). _Note: this is not the Packagist package name (e.g. `xdebug/xdebug`)_. | `xdebug`                    |
+| `@version@`, `@package_version@`, `@package-version@` | The "pretty" version of the package defined in `composer.json`.                                                                        | `3.3.2`                     |
+| `@release_date@`, `@release-date@`                    | The formatted release date according to Composer package metadata.                                                                     | `2024-01-15T10:00:00+00:00` |
+| `@php_bin@`, `@php-bin@`                              | The full path to the PHP binary executable used during the build.                                                                      | `/usr/bin/php8.4`           |

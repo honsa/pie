@@ -7,19 +7,22 @@ namespace Php\Pie\ComposerIntegration\Listeners;
 use Composer\Composer;
 use Composer\DependencyResolver\Operation\InstallOperation;
 use Composer\DependencyResolver\Operation\OperationInterface;
+use Composer\DependencyResolver\Operation\UpdateOperation;
 use Composer\Installer\InstallerEvent;
 use Composer\Installer\InstallerEvents;
 use Composer\IO\IOInterface;
 use Composer\Package\CompletePackageInterface;
-use Composer\Util\AuthHelper;
 use Composer\Util\HttpDownloader;
 use Php\Pie\ComposerIntegration\PieComposerRequest;
 use Php\Pie\DependencyResolver\Package;
 use Php\Pie\Downloading\DownloadUrlMethod;
 use Php\Pie\Downloading\PackageReleaseAssets;
 use Psr\Container\ContainerInterface;
+use Throwable;
 
+use function array_merge_recursive;
 use function array_walk;
+use function in_array;
 use function pathinfo;
 
 use const PATHINFO_EXTENSION;
@@ -51,59 +54,131 @@ class OverrideDownloadUrlInstallListener
 
     public function __invoke(InstallerEvent $installerEvent): void
     {
-        /** @psalm-suppress InternalMethod */
         $operations = $installerEvent->getTransaction()?->getOperations() ?? [];
 
         array_walk(
             $operations,
             function (OperationInterface $operation): void {
-                if (! $operation instanceof InstallOperation) {
+                if (! $operation instanceof InstallOperation && ! $operation instanceof UpdateOperation) {
                     return;
                 }
 
-                $composerPackage = $operation->getPackage();
+                $composerPackage = $operation instanceof UpdateOperation ? $operation->getTargetPackage() : $operation->getPackage();
                 if (! $composerPackage instanceof CompletePackageInterface) {
                     return;
                 }
 
                 // Install requests for other packages than the one we want should be ignored
-                if ($this->composerRequest->requestedPackage->package !== $composerPackage->getName()) {
+                if (! $this->composerRequest->isFor($composerPackage->getName())) {
                     return;
                 }
 
-                $piePackage        = Package::fromComposerCompletePackage($composerPackage);
-                $targetPlatform    = $this->composerRequest->targetPlatform;
-                $downloadUrlMethod = DownloadUrlMethod::fromPackage($piePackage, $targetPlatform);
+                $piePackage         = Package::fromComposerCompletePackage($composerPackage);
+                $targetPlatform     = $this->composerRequest->targetPlatform;
+                $downloadUrlMethods = DownloadUrlMethod::possibleDownloadUrlMethodsForPackage($piePackage, $targetPlatform);
 
-                // Exit early if we should just use Composer's normal download
-                if ($downloadUrlMethod === DownloadUrlMethod::ComposerDefaultDownload) {
-                    return;
+                if ($this->composerRequest->suppressedDownloadUrlMethods !== []) {
+                    $remainingDownloadUrlMethods = [];
+
+                    foreach ($downloadUrlMethods as $downloadUrlMethod) {
+                        if (in_array($downloadUrlMethod, $this->composerRequest->suppressedDownloadUrlMethods, true)) {
+                            $this->io->write('Suppressing download method: ' . $downloadUrlMethod->value, verbosity: IOInterface::VERBOSE);
+                            continue;
+                        }
+
+                        $remainingDownloadUrlMethods[] = $downloadUrlMethod;
+                    }
+
+                    if ($remainingDownloadUrlMethods === []) {
+                        throw AllDownloadUrlMethodsSuppressed::forPackage($piePackage);
+                    }
+
+                    $downloadUrlMethods = $remainingDownloadUrlMethods;
                 }
 
-                $possibleAssetNames = $downloadUrlMethod->possibleAssetNames($piePackage, $targetPlatform);
-                if ($possibleAssetNames === null) {
-                    return;
+                $selectedDownloadUrlMethod = null;
+                $downloadMethodFailures    = [];
+
+                foreach ($downloadUrlMethods as $downloadUrlMethod) {
+                    $this->io->write('Trying to download using: ' . $downloadUrlMethod->value, verbosity: IOInterface::VERY_VERBOSE);
+
+                    if ($downloadUrlMethod === DownloadUrlMethod::PrePackagedBinary && $this->composerRequest->configureOptionsFor($composerPackage->getName()) !== []) {
+                        $configureOptionsConflictMessage = 'Cannot use pre-packaged-binary download method, as configure options were passed.';
+
+                        $downloadMethodFailures[$downloadUrlMethod->value] = $configureOptionsConflictMessage;
+                        $this->io->write($configureOptionsConflictMessage, verbosity: IOInterface::VERBOSE);
+
+                        continue;
+                    }
+
+                    // Exit early if we should just use Composer's normal download
+                    if ($downloadUrlMethod === DownloadUrlMethod::ComposerDefaultDownload) {
+                        $selectedDownloadUrlMethod = $downloadUrlMethod;
+                        break;
+                    }
+
+                    try {
+                        $possibleAssetNames = $downloadUrlMethod->possibleAssetNames($piePackage, $targetPlatform);
+                    } catch (Throwable $t) {
+                        $downloadMethodFailures[$downloadUrlMethod->value] = $t->getMessage();
+                        $this->io->write('Failed fetching asset names [' . $downloadUrlMethod->value . ']: ' . $t->getMessage(), verbosity: IOInterface::VERBOSE);
+                        continue;
+                    }
+
+                    if ($possibleAssetNames === null) {
+                        $downloadMethodFailures[$downloadUrlMethod->value] = 'No asset names';
+                        $this->io->write('Failed fetching asset names [' . $downloadUrlMethod->value . ']: No asset names', verbosity: IOInterface::VERBOSE);
+                        continue;
+                    }
+
+                    // @todo https://github.com/php/pie/issues/138 will need to depend on the repo type (GH/GL/BB/etc.)
+                    $packageReleaseAssets = $this->container->get(PackageReleaseAssets::class);
+
+                    try {
+                        $matchedReleaseAsset = $packageReleaseAssets->findMatchingReleaseAsset(
+                            $targetPlatform,
+                            $piePackage,
+                            new HttpDownloader($this->io, $this->composer->getConfig()),
+                            $downloadUrlMethod,
+                            $possibleAssetNames,
+                        );
+                    } catch (Throwable $t) {
+                        $downloadMethodFailures[$downloadUrlMethod->value] = $t->getMessage();
+                        $this->io->write('Failed locating asset [' . $downloadUrlMethod->value . ']: ' . $t->getMessage(), verbosity: IOInterface::VERBOSE);
+                        continue;
+                    }
+
+                    $this->composerRequest->pieOutput->write('Found prebuilt archive: ' . $matchedReleaseAsset->url);
+                    $composerPackage->setDistUrl($matchedReleaseAsset->url);
+
+                    $composerPackage->setTransportOptions(array_merge_recursive(
+                        $composerPackage->getTransportOptions(),
+                        ['http' => ['header' => ['Accept: application/octet-stream']]],
+                    ));
+
+                    // Composer's dist-sha was computed against the original
+                    // Packagist URL; once we swap to a release-asset URL the
+                    // FileDownloader has nothing to validate the new bytes
+                    // against. Surface that so the caller knows HTTPS-to-origin
+                    // is the only integrity guarantee left.
+                    $this->composerRequest->pieOutput->write(
+                        '<warning>Note: dist-sha integrity check is not available for prebuilt-binary URLs; HTTPS to the release-asset origin is the only integrity guarantee.</warning>',
+                    );
+
+                    if (pathinfo($matchedReleaseAsset->filename, PATHINFO_EXTENSION) === 'tgz') {
+                        $composerPackage->setDistType('tar');
+                    }
+
+                    $selectedDownloadUrlMethod = $downloadUrlMethod;
+                    break;
                 }
 
-                // @todo https://github.com/php/pie/issues/138 will need to depend on the repo type (GH/GL/BB/etc.)
-                $packageReleaseAssets = $this->container->get(PackageReleaseAssets::class);
-
-                $url = $packageReleaseAssets->findMatchingReleaseAssetUrl(
-                    $targetPlatform,
-                    $piePackage,
-                    new AuthHelper($this->io, $this->composer->getConfig()),
-                    new HttpDownloader($this->io, $this->composer->getConfig()),
-                    $possibleAssetNames,
-                );
-
-                $this->composerRequest->pieOutput->writeln('Found prebuilt archive: ' . $url);
-                $composerPackage->setDistUrl($url);
-
-                if (pathinfo($url, PATHINFO_EXTENSION) !== 'tgz') {
-                    return;
+                if ($selectedDownloadUrlMethod === null) {
+                    throw CouldNotDetermineDownloadUrlMethod::fromDownloadUrlMethods($piePackage, $downloadUrlMethods, $downloadMethodFailures);
                 }
 
-                $composerPackage->setDistType('tar');
+                $selectedDownloadUrlMethod->writeToComposerPackage($composerPackage);
+                $this->io->write('<info>Selected download URL method: ' . $selectedDownloadUrlMethod->value . '</info>', verbosity: IOInterface::VERBOSE);
             },
         );
     }

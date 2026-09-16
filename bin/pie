@@ -6,17 +6,20 @@ declare(strict_types=1);
 namespace Php\Pie;
 
 use Php\Pie\Command\BuildCommand;
-use Php\Pie\Command\InstallExtensionsForProjectCommand;
+use Php\Pie\Command\CheckBuildToolsCommand;
 use Php\Pie\Command\DownloadCommand;
 use Php\Pie\Command\InfoCommand;
 use Php\Pie\Command\InstallCommand;
+use Php\Pie\Command\InstallExtensionsForProjectCommand;
 use Php\Pie\Command\RepositoryAddCommand;
 use Php\Pie\Command\RepositoryListCommand;
 use Php\Pie\Command\RepositoryRemoveCommand;
+use Php\Pie\Command\SearchCommand;
 use Php\Pie\Command\SelfUpdateCommand;
 use Php\Pie\Command\SelfVerifyCommand;
 use Php\Pie\Command\ShowCommand;
 use Php\Pie\Command\UninstallCommand;
+use Php\Pie\Command\UpgradeCommand;
 use Php\Pie\Util\PieVersion;
 use Symfony\Component\Console\Application;
 use Symfony\Component\Console\CommandLoader\ContainerCommandLoader;
@@ -24,7 +27,16 @@ use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\Console\Output\OutputInterface;
 use Symfony\Component\EventDispatcher\EventDispatcher;
 
-/** @psalm-suppress UnresolvableInclude */
+use function error_reporting;
+
+use const E_DEPRECATED;
+
+require_once __DIR__ . '/../src/Util/PieVersion.php';
+if (PieVersion::isPharBuild()) {
+    error_reporting(error_reporting() & ~E_DEPRECATED);
+}
+
+// phpcs:ignore Squiz.NamingConventions.ValidVariableName.NotCamelCaps
 include $_composer_autoload_path ?? __DIR__ . '/../vendor/autoload.php';
 
 $container = Container::factory();
@@ -39,8 +51,10 @@ $application->setCommandLoader(new ContainerCommandLoader(
         'download' => DownloadCommand::class,
         'build' => BuildCommand::class,
         'install' => InstallCommand::class,
+        'upgrade' => UpgradeCommand::class,
         'info' => InfoCommand::class,
         'show' => ShowCommand::class,
+        'search' => SearchCommand::class,
         'repository:list' => RepositoryListCommand::class,
         'repository:add' => RepositoryAddCommand::class,
         'repository:remove' => RepositoryRemoveCommand::class,
@@ -48,7 +62,8 @@ $application->setCommandLoader(new ContainerCommandLoader(
         'self-update' => SelfUpdateCommand::class,
         'self-verify' => SelfVerifyCommand::class,
         'install-extensions-for-project' => InstallExtensionsForProjectCommand::class,
-    ]
+        'check-build-tools' => CheckBuildToolsCommand::class,
+    ],
 ));
 
 $application->run($container->get(InputInterface::class), $container->get(OutputInterface::class));

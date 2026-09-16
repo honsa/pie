@@ -4,8 +4,10 @@ declare(strict_types=1);
 
 namespace Php\Pie\File;
 
+use Composer\Util\Platform as ComposerPlatform;
+use Php\Pie\Platform;
+use Php\Pie\Platform\TargetPlatform;
 use Symfony\Component\Process\ExecutableFinder;
-use Throwable;
 
 use function is_string;
 
@@ -22,11 +24,19 @@ final class Sudo
      */
     public static function find(): string
     {
+        if (ComposerPlatform::isWindows()) {
+            throw SudoNotFoundOnSystem::new();
+        }
+
         if (! is_string(self::$memoizedSudo)) {
             $sudo = (new ExecutableFinder())->find('sudo');
 
             if ($sudo === null || $sudo === '') {
                 throw SudoNotFoundOnSystem::new();
+            }
+
+            if (! TargetPlatform::isRunningAsRoot() && ! Platform::isInteractive()) {
+                throw SudoRequiresInteractiveTerminal::fromSudo($sudo);
             }
 
             self::$memoizedSudo = $sudo;
@@ -41,7 +51,7 @@ final class Sudo
             self::find();
 
             return true;
-        } catch (Throwable) {
+        } catch (SudoNotFoundOnSystem) {
             return false;
         }
     }

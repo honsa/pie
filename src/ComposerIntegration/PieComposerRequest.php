@@ -4,10 +4,13 @@ declare(strict_types=1);
 
 namespace Php\Pie\ComposerIntegration;
 
+use Composer\IO\IOInterface;
 use Php\Pie\DependencyResolver\RequestedPackageAndVersion;
-use Php\Pie\Platform\TargetPhp\PhpizePath;
+use Php\Pie\Downloading\DownloadUrlMethod;
 use Php\Pie\Platform\TargetPlatform;
-use Symfony\Component\Console\Output\OutputInterface;
+
+use function array_map;
+use function in_array;
 
 /**
  * @internal This is not public API for PIE, so should not be depended upon unless you accept the risk of BC breaks
@@ -16,16 +19,31 @@ use Symfony\Component\Console\Output\OutputInterface;
  */
 final class PieComposerRequest
 {
-    /** @param list<non-empty-string> $configureOptions */
+    /** @var list<string> */
+    private readonly array $requestedPackageNames;
+
+    /**
+     * @param list<RequestedPackageAndVersion>      $requestedPackages
+     * @param array<string, list<non-empty-string>> $configureOptions             Keyed by package name
+     * @param list<DownloadUrlMethod>               $suppressedDownloadUrlMethods
+     */
     public function __construct(
-        public readonly OutputInterface $pieOutput,
+        public readonly IOInterface $pieOutput,
         public readonly TargetPlatform $targetPlatform,
-        public readonly RequestedPackageAndVersion $requestedPackage,
+        public readonly array $requestedPackages,
         public readonly PieOperation $operation,
         public readonly array $configureOptions,
-        public readonly PhpizePath|null $phpizePath,
         public readonly bool $attemptToSetupIniFile,
+        public readonly bool $installAllPackages = false,
+        public readonly array $suppressedDownloadUrlMethods = [],
     ) {
+        $this->requestedPackageNames = array_map(static fn (RequestedPackageAndVersion $request) => $request->package, $this->requestedPackages);
+    }
+
+    /** @return list<non-empty-string> */
+    public function configureOptionsFor(string $packageName): array
+    {
+        return $this->configureOptions[$packageName] ?? [];
     }
 
     /**
@@ -33,17 +51,25 @@ final class PieComposerRequest
      * for example just reading metadata about the installed system.
      */
     public static function noOperation(
-        OutputInterface $pieOutput,
+        IOInterface $pieOutput,
         TargetPlatform $targetPlatform,
     ): self {
         return new PieComposerRequest(
             $pieOutput,
             $targetPlatform,
-            new RequestedPackageAndVersion('null', null),
+            [],
             PieOperation::Resolve,
             [],
-            null,
             false,
         );
+    }
+
+    public function isFor(string $packageName): bool
+    {
+        if ($this->installAllPackages) {
+            return true;
+        }
+
+        return in_array($packageName, $this->requestedPackageNames);
     }
 }

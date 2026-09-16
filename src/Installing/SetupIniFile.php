@@ -4,19 +4,19 @@ declare(strict_types=1);
 
 namespace Php\Pie\Installing;
 
+use Composer\IO\IOInterface;
 use Php\Pie\Downloading\DownloadedPackage;
 use Php\Pie\ExtensionType;
 use Php\Pie\File\BinaryFile;
 use Php\Pie\Installing\Ini\SetupIniApproach;
 use Php\Pie\Platform\TargetPlatform;
-use Symfony\Component\Console\Output\OutputInterface;
+use Php\Pie\Util\Emoji;
 
 use function sprintf;
 
 /** @internal This is not public API for PIE, so should not be depended upon unless you accept the risk of BC breaks */
 class SetupIniFile
 {
-    /** @psalm-suppress PossiblyUnusedMethod no direct reference; used in service locator */
     public function __construct(private readonly SetupIniApproach $setupIniApproach)
     {
     }
@@ -25,25 +25,25 @@ class SetupIniFile
         TargetPlatform $targetPlatform,
         DownloadedPackage $downloadedPackage,
         BinaryFile $binaryFile,
-        OutputInterface $output,
+        IOInterface $io,
         bool $attemptToSetupIniFile,
     ): void {
         if (
             $attemptToSetupIniFile
             && $this->setupIniApproach->canBeUsed($targetPlatform)
-            && $this->setupIniApproach->setup($targetPlatform, $downloadedPackage, $binaryFile, $output)
+            && $this->setupIniApproach->setup($targetPlatform, $downloadedPackage, $binaryFile, $io)
         ) {
-            $output->writeln(sprintf(
-                '<info>✅ Extension is enabled and loaded in</info> %s',
+            $io->write(sprintf(
+                '<info>%s Extension %s is enabled and loaded in</info> %s',
+                Emoji::GREEN_CHECKMARK,
+                $downloadedPackage->package->prettyNameAndVersion(),
                 $targetPlatform->phpBinaryPath->phpBinaryPath,
             ));
+        } elseif (! $attemptToSetupIniFile) {
+            $io->write('Automatic extension enabling was skipped.', verbosity: IOInterface::VERBOSE);
         } else {
-            if (! $attemptToSetupIniFile) {
-                $output->writeln('Automatic extension enabling was skipped.', OutputInterface::VERBOSITY_VERBOSE);
-            }
-
-            $output->writeln('<comment>⚠️  Extension has NOT been automatically enabled.</comment>');
-            $output->writeln(sprintf(
+            $io->write(sprintf('<comment>%s Extension has NOT been automatically enabled.</comment>', Emoji::WARNING));
+            $io->write(sprintf(
                 '<comment>You must now add "%s=%s" to your php.ini</comment>',
                 $downloadedPackage->package->extensionType() === ExtensionType::PhpModule ? 'extension' : 'zend_extension',
                 $downloadedPackage->package->extensionName()->name(),
